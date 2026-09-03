@@ -49,8 +49,8 @@ addopts = [
 ]
 
 [tool.uv.sources]
-claymodel = { git = "https://github.com/Clay-foundation/model.git" }
-geobench = { git = "https://github.com/ServiceNow/geo-bench.git" }
+claymodel = { path = "/root/autodl-tmp/olmoearth_pretrain/deps/claymodel" }
+geobench = { path = "/root/autodl-tmp/olmoearth_pretrain/deps/geo-bench }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
   { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
