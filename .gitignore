@@ -181,3 +181,7 @@ cython_debug/
 local_output/
 test_vis/
 wandb/
+
+
+olmoearth.pdf
+weights/weights.pth
