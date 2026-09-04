@@ -5,21 +5,28 @@ Weights download automatically from Hugging Face on first run
 
     export HF_ENDPOINT=https://hf-mirror.com
 
+If HF is unreachable, download manually into a folder and pass --local-dir:
+
+    mkdir -p ~/autodl-tmp/weights/OlmoEarth-v1_2-Base
+    # put config.json + weights.pth in that folder
+    python scripts/tools/smoke_test_inference.py --local-dir ~/autodl-tmp/weights/OlmoEarth-v1_2-Base
+
 Usage:
 
     python scripts/tools/smoke_test_inference.py
-    python scripts/tools/smoke_test_inference.py --model OlmoEarth-v1_2-Nano
+    python scripts/tools/smoke_test_inference.py --model OlmoEarth-v1_2-Base
     python scripts/tools/smoke_test_inference.py --no-weights   # config only, random init
 """
 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import torch
 
 from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, MaskValue
-from olmoearth_pretrain.model_loader import ModelID, load_model_from_id
+from olmoearth_pretrain.model_loader import ModelID, load_model_from_id, load_model_from_path
 
 
 def _parse_args() -> argparse.Namespace:
@@ -32,9 +39,15 @@ def _parse_args() -> argparse.Namespace:
         help="HF model id (default: Nano, smallest download).",
     )
     p.add_argument(
+        "--local-dir",
+        type=str,
+        default=None,
+        help="Local folder containing config.json + weights.pth (skips HF download).",
+    )
+    p.add_argument(
         "--no-weights",
         action="store_true",
-        help="Skip weights.pth download; random init (still needs config.json).",
+        help="Skip weights.pth; random init (still needs config.json).",
     )
     p.add_argument("--h", type=int, default=64, help="Spatial height.")
     p.add_argument("--w", type=int, default=64, help="Spatial width.")
@@ -45,13 +58,25 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_id = ModelID(args.model)
 
     print(f"device={device}")
-    print(f"model={model_id.value}  load_weights={not args.no_weights}")
-    print("loading (first run downloads from Hugging Face)...")
+    if args.local_dir:
+        local_dir = Path(args.local_dir).expanduser().resolve()
+        print(f"loading from local dir: {local_dir}")
+        for name in ("config.json", "weights.pth"):
+            if not (local_dir / name).is_file() and not (
+                args.no_weights and name == "weights.pth"
+            ):
+                if name == "weights.pth" and args.no_weights:
+                    continue
+                raise FileNotFoundError(f"missing {local_dir / name}")
+        model = load_model_from_path(local_dir, load_weights=not args.no_weights)
+    else:
+        model_id = ModelID(args.model)
+        print(f"model={model_id.value}  load_weights={not args.no_weights}")
+        print("loading (first run downloads from Hugging Face)...")
+        model = load_model_from_id(model_id, load_weights=not args.no_weights)
 
-    model = load_model_from_id(model_id, load_weights=not args.no_weights)
     model.to(device).eval()
     print("model loaded")
 
