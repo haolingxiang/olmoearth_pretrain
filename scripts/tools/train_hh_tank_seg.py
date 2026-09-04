@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -39,8 +40,45 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, MaskValue
-from olmoearth_pretrain.evals.finetune.unet_head import UNetDecoder
 from olmoearth_pretrain.model_loader import load_model_from_path
+
+
+class UNetDecoder(nn.Module):
+    """Upsample ViT patch tokens (B,H',W',D) to per-pixel logits (B,C,H,W).
+
+    Inlined from ``evals.finetune.unet_head`` so this script does not pull the
+    full eval dependency stack (rioxarray, geobench, ...).
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        num_classes: int,
+        patch_size: int,
+        conv_layers_per_resolution: int = 1,
+    ) -> None:
+        if patch_size < 1 or (patch_size & (patch_size - 1)) != 0:
+            raise ValueError(f"patch_size must be a power of two, got {patch_size}")
+        super().__init__()
+        n_stages = int(math.log2(patch_size))
+
+        def conv() -> list[nn.Module]:
+            return [
+                nn.Conv2d(in_dim, in_dim, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+            ]
+
+        layers: list[nn.Module] = conv()
+        for _ in range(n_stages):
+            layers.append(nn.Upsample(scale_factor=2, mode="nearest"))
+            for _ in range(conv_layers_per_resolution):
+                layers.extend(conv())
+        layers.append(nn.Conv2d(in_dim, num_classes, kernel_size=3, padding=1))
+        self.decoder = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return self.decoder(x)
 
 
 def _read_tif(path: Path) -> np.ndarray:
