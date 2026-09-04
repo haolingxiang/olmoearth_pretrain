@@ -400,7 +400,9 @@ def eval_only(args: argparse.Namespace) -> None:
             for batch in loader:
                 images = batch["image"].to(device)
                 logits = model(images)
-                pred = logits.argmax(dim=1).cpu().numpy().astype(np.uint8)
+                # Save as 0/255 so OS image viewers show tanks as white
+                # (training still uses 0/1 class indices internally).
+                pred = (logits.argmax(dim=1).cpu().numpy().astype(np.uint8) * 255)
                 for name, p in zip(batch["name"], pred, strict=True):
                     out = pred_dir / name
                     with rasterio.open(
