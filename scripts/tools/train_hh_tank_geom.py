@@ -1,4 +1,8 @@
-"""Frozen OlmoEarth encoder + dual-task head for tank geometry.
+"""Frozen OlmoEarth + local detail/CBAM branch for tank geometry.
+
+Version 2 follows the supplied OilWatch paper, Fig.5 and p18 Eq.3-5.
+The paper's h is floating-roof descent; stored depth is H-h. See
+docs/HH-Tank-Geometry.md for migration, validation and Linux commands.
 
 Supervised targets (need labels)::
 
@@ -35,23 +39,40 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import rasterio
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
-from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, MaskValue
-from olmoearth_pretrain.model_loader import load_model_from_path
+
+class CBAM(nn.Module):
+    """Channel and spatial attention inspired by OilWatch Fig. 5."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        hidden = max(channels // 8, 4)
+        self.channel = nn.Sequential(
+            nn.Conv2d(channels, hidden, 1), nn.ReLU(), nn.Conv2d(hidden, channels, 1)
+        )
+        self.spatial = nn.Conv2d(2, 1, 7, padding=3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.channel(F.adaptive_avg_pool2d(x, 1))
+        weight = weight + self.channel(F.adaptive_max_pool2d(x, 1))
+        x = x * weight.sigmoid()
+        summary = torch.cat([x.mean(1, keepdim=True), x.max(1, keepdim=True)[0]], 1)
+        return x * self.spatial(summary).sigmoid()
 
 
 # ---------------------------------------------------------------------------
-# Head only: shared neck + dual task decoders (no CBAM)
+# Frozen satellite features + optional local detail/CBAM + dual task decoders
 # ---------------------------------------------------------------------------
 
 
@@ -118,15 +139,45 @@ class DualTaskHead(nn.Module):
         patch_size: int,
         mid_dim: int = 256,
         decoder_depth: int = 3,
+        detail_branch: bool = False,
     ) -> None:
         super().__init__()
         self.neck = SharedUpsampleNeck(in_dim, mid_dim, patch_size)
         feat_ch = self.neck.out_dim
+        self.detail_branch = detail_branch
+        if detail_branch:
+            # Preserve fine scattering cues lost by patch tokenization. This is
+            # a local skip branch, not a reproduction of the paper's full U-Net.
+            self.detail = nn.Sequential(
+                nn.Conv2d(2, 32, 3, padding=1),
+                nn.GroupNorm(8, 32),
+                nn.ReLU(),
+                nn.Conv2d(32, 32, 3, padding=1),
+                nn.GroupNorm(8, 32),
+                nn.ReLU(),
+                CBAM(32),
+            )
+            self.fuse = nn.Sequential(
+                nn.Conv2d(feat_ch + 32, feat_ch, 3, padding=1),
+                nn.GroupNorm(8, feat_ch),
+                nn.ReLU(),
+                CBAM(feat_ch),
+            )
         self.mask_decoder = TaskDecoder(feat_ch, out_ch=2, depth=decoder_depth)
         self.kp_decoder = TaskDecoder(feat_ch, out_ch=3, depth=decoder_depth)
 
-    def forward(self, tokens: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self, tokens: torch.Tensor, images: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
         feat = self.neck(tokens)
+        if self.detail_branch:
+            if images is None:
+                raise ValueError("detail branch requires input images")
+            detail = self.detail(images)
+            feat = F.interpolate(
+                feat, size=detail.shape[-2:], mode="bilinear", align_corners=False
+            )
+            feat = self.fuse(torch.cat([feat, detail], dim=1))
         return {
             "seg_logits": self.mask_decoder(feat),
             "kp_heatmaps": self.kp_decoder(feat),
@@ -143,6 +194,7 @@ class HHTankGeomModel(nn.Module):
         patch_size: int = 4,
         mid_dim: int = 256,
         decoder_depth: int = 3,
+        detail_branch: bool = False,
     ) -> None:
         super().__init__()
         self.backbone = backbone
@@ -154,7 +206,11 @@ class HHTankGeomModel(nn.Module):
         nn.init.eye_(self.proj.weight[:, :, 0, 0])
         nn.init.zeros_(self.proj.bias)
         self.head = DualTaskHead(
-            emb_dim, patch_size, mid_dim=mid_dim, decoder_depth=decoder_depth
+            emb_dim,
+            patch_size,
+            mid_dim=mid_dim,
+            decoder_depth=decoder_depth,
+            detail_branch=detail_branch,
         )
 
     def train(self, mode: bool = True):  # noqa: A003
@@ -163,6 +219,8 @@ class HHTankGeomModel(nn.Module):
         return self
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
+        from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, MaskValue
+
         b, _, h, w = images.shape
         x = self.proj(images).permute(0, 2, 3, 1).unsqueeze(3)
         sample = MaskedOlmoEarthSample(
@@ -173,14 +231,13 @@ class HHTankGeomModel(nn.Module):
                 [[[1, 0, 2020]]] * b, device=x.device, dtype=torch.long
             ),
         )
-        with torch.no_grad():
-            out = self.backbone.encoder(
-                sample, fast_pass=True, patch_size=self.patch_size
-            )
+        # Frozen parameters still need autograd with respect to the trainable
+        # input projection. eval callers already run under torch.no_grad().
+        out = self.backbone.encoder(sample, fast_pass=True, patch_size=self.patch_size)
         return out["tokens_and_masks"].sentinel1.mean(dim=(3, 4))
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        return self.head(self.encode(images))
+        return self.head(self.encode(images), images)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +246,8 @@ class HHTankGeomModel(nn.Module):
 
 
 def _read_tif(path: Path) -> np.ndarray:
+    import rasterio
+
     with rasterio.open(path) as src:
         arr = src.read()
     return arr[0] if arr.ndim == 3 else arr
@@ -220,6 +279,56 @@ def _origin_offset(shape: tuple[int, ...], size: int) -> tuple[float, float]:
     hp, wp = h + pad_h, w + pad_w
     y0, x0 = max(0, (hp - size) // 2), max(0, (wp - size) // 2)
     return float(pad_top - y0), float(pad_left - x0)
+
+
+def letterbox(
+    arr: np.ndarray, size: int, is_mask: bool = False
+) -> tuple[np.ndarray, float, float, float]:
+    """Pad to a square, then resize isotropically; return scale and xy offsets.
+
+    align_corners=False maps pixel centres as x'=(x+pad+0.5)*scale-0.5.
+    Segmentation padding is ignored in the loss, never reflected into new roofs.
+    """
+    h, w = arr.shape
+    side = max(h, w)
+    top, left = (side - h) // 2, (side - w) // 2
+    padded = np.pad(
+        arr.astype(np.float32),
+        ((top, side - h - top), (left, side - w - left)),
+        mode="constant",
+        constant_values=-100 if is_mask else 0,
+    )
+    x = torch.from_numpy(padded)[None, None]
+    if is_mask:
+        x = F.interpolate(x, size=(size, size), mode="nearest")
+    else:
+        x = F.interpolate(x, size=(size, size), mode="bilinear", align_corners=False)
+    scale = size / side
+    return x[0, 0].numpy(), scale, (left + 0.5) * scale - 0.5, (top + 0.5) * scale - 0.5
+
+
+def restore_mask(
+    mask: np.ndarray, shape: tuple[int, int], preprocess: str
+) -> np.ndarray:
+    """Map a network mask to original pixels before radius fitting/export."""
+    h, w = shape
+    size = mask.shape[0]
+    if preprocess == "letterbox":
+        side = max(h, w)
+        full = F.interpolate(
+            torch.from_numpy(mask.astype(np.float32))[None, None],
+            size=(side, side),
+            mode="nearest",
+        )[0, 0].numpy()
+        top, left = (side - h) // 2, (side - w) // 2
+        return full[top : top + h, left : left + w].astype(np.uint8)
+    oy, ox = _origin_offset(shape, size)
+    result = np.zeros(shape, dtype=np.uint8)
+    yy, xx = np.indices(shape)
+    sy, sx = yy + int(oy), xx + int(ox)
+    valid = (sy >= 0) & (sx >= 0) & (sy < size) & (sx < size)
+    result[valid] = mask[sy[valid], sx[valid]]
+    return result
 
 
 def _gaussian_heatmap(
@@ -255,6 +364,7 @@ class TankGeomDataset(Dataset):
         split: str,
         size: int = 128,
         sigma: float = 2.0,
+        preprocess: str = "letterbox",
     ) -> None:
         self.split = split
         self.image_dir = root / split / "image"
@@ -262,6 +372,7 @@ class TankGeomDataset(Dataset):
         self.key_dir = root / split / "key"
         self.size = size
         self.sigma = sigma
+        self.preprocess = preprocess
         self.paths = sorted(self.image_dir.glob("*.tif"))
         if not self.paths:
             raise FileNotFoundError(self.image_dir)
@@ -277,25 +388,46 @@ class TankGeomDataset(Dataset):
         mask = _binarize_mask(_read_tif(self.mask_dir / name))
         key = _parse_key_json(self.key_dir / f"{stem}.json")
 
-        img_f = _fit_square_simple(img, self.size)
-        mask_f = _fit_square_simple(mask, self.size)
-        oy, ox = _origin_offset(img.shape, self.size)
+        if img.shape != mask.shape:
+            raise ValueError(f"Image/mask shape mismatch: {name}")
+        if self.preprocess == "letterbox":
+            img = (img - float(img.mean())) / (float(img.std()) + 1e-6)
+            img_f, scale, ox, oy = letterbox(img, self.size)
+            mask_f, _, _, _ = letterbox(mask, self.size, is_mask=True)
+        elif self.preprocess == "legacy":
+            img_f = _fit_square_simple(img, self.size)
+            mask_f = _fit_square_simple(mask, self.size)
+            oy, ox = _origin_offset(img.shape, self.size)
+            scale = 1.0
+        else:
+            raise ValueError(self.preprocess)
 
         heats = np.zeros((3, self.size, self.size), dtype=np.float32)
+        points = []
+        valid = []
         for i, lab in enumerate(("O1", "O2", "O3")):
             if lab not in key["points"]:
+                # Missing annotations are unknown, not background targets.
+                points.append([0.0, 0.0])
+                valid.append(False)
                 continue
             x, y = key["points"][lab]  # type: ignore[index]
-            heats[i] = _gaussian_heatmap(self.size, self.size, x + ox, y + oy, self.sigma)
+            x, y = x * scale + ox, y * scale + oy
+            points.append([x, y])
+            valid.append(0 <= x < self.size and 0 <= y < self.size)
+            if self.preprocess == "letterbox" and not valid[-1]:
+                raise ValueError(f"Annotated {lab} outside image: {name}")
+            heats[i] = _gaussian_heatmap(self.size, self.size, x, y, self.sigma)
 
         if key["circle"] is not None:
             r_mask_px = float(key["circle"][2])  # type: ignore[index]
         else:
-            area = float(mask_f.sum())
+            area = float(mask.sum())
             r_mask_px = math.sqrt(area / math.pi) if area > 0 else 0.0
 
-        std = float(img_f.std())
-        img_f = (img_f - float(img_f.mean())) / (std + 1e-6)
+        if self.preprocess == "legacy":
+            std = float(img_f.std())
+            img_f = (img_f - float(img_f.mean())) / (std + 1e-6)
         x = np.stack([img_f, img_f], axis=0)
 
         return {
@@ -303,6 +435,11 @@ class TankGeomDataset(Dataset):
             "mask": torch.from_numpy(mask_f).long(),
             "heatmaps": torch.from_numpy(heats),
             "r_mask_px": torch.tensor(r_mask_px, dtype=torch.float32),
+            "points": torch.tensor(points, dtype=torch.float32),
+            "kp_valid": torch.tensor(valid, dtype=torch.bool),
+            "scale": torch.tensor(scale, dtype=torch.float32),
+            "offset": torch.tensor([ox, oy], dtype=torch.float32),
+            "original_shape": torch.tensor(img.shape, dtype=torch.long),
             "name": name,
             "split": self.split,
         }
@@ -315,8 +452,10 @@ def load_meta(path: Path | None) -> dict[str, dict[str, float]]:
     ``filename``, ``pixel_resolution``, ``incidenceangle``; optional ``split``.
     Prefer ``split/filename`` when ``split`` exists (avoids train/test collisions).
     """
-    if path is None or not path.is_file():
+    if path is None:
         return {}
+    if not path.is_file():
+        raise FileNotFoundError(path)
     suf = path.suffix.lower()
     if suf in {".xlsx", ".xls"}:
         df = pd.read_excel(path)
@@ -371,15 +510,47 @@ def volume_from_geometry(
     r_mask_px: float,
     sr: float,
     delta_deg: float,
-) -> dict[str, float]:
+    formula: str = "paper",
+) -> dict[str, float | str | bool]:
+    """OilWatch p18 Eq.3-5: h is roof descent; oil depth is H-h.
+
+    Invalid geometry is reported as NaN volume, not silently labelled empty.
+    legacy reproduces the former one-radius/clamped oil-depth calculation.
+    """
+    if not math.isfinite(sr) or sr <= 0 or not 0 < delta_deg < 90:
+        raise ValueError("Require positive pixel spacing and 0 < incidence angle < 90")
     delta = math.radians(float(delta_deg))
     d12 = float(np.linalg.norm(o1 - o2))
     d13 = float(np.linalg.norm(o1 - o3))
     r_m = sr * r_mask_px / max(math.sin(delta), 1e-6)
-    h_m = max(sr * (d13 - r_mask_px) / max(math.cos(delta), 1e-6), 0.0)
     H_m = sr * d12 / max(math.cos(delta), 1e-6)
-    v_m3 = math.pi * r_m * r_m * h_m
-    return {"R_m": r_m, "H_m": H_m, "h_m": h_m, "V_m3": v_m3, "V_bbl": v_m3 / 0.158987}
+    if formula == "legacy":
+        oil = max(sr * (d13 - r_mask_px) / math.cos(delta), 0.0)
+        h_m = oil  # Historical column meaning, only in explicit legacy mode.
+        valid = r_m > 0 and math.isfinite(oil)
+        status = "legacy_formula"
+    elif formula == "paper":
+        h_m = sr * (d13 - 2 * r_mask_px) / math.cos(delta)
+        oil = H_m - h_m
+        valid = all(math.isfinite(v) for v in (r_m, H_m, h_m, oil))
+        valid = valid and r_m > 0 and H_m > 0 and 0 <= h_m <= H_m
+        status = "ok" if valid else "invalid_geometry"
+    else:
+        raise ValueError(formula)
+    raw_v = math.pi * r_m * r_m * oil
+    v_m3 = raw_v if valid else float("nan")
+    return {
+        "R_m": r_m,
+        "H_m": H_m,
+        "h_m": h_m,
+        "oil_height_raw_m": oil,
+        "V_raw_m3": raw_v,
+        "V_m3": v_m3,
+        "V_bbl": v_m3 / 0.158987,
+        "geometry_valid": valid,
+        "geometry_status": status,
+        "formula": formula,
+    }
 
 
 def heatmaps_to_points(heat: np.ndarray) -> np.ndarray:
@@ -391,7 +562,9 @@ def heatmaps_to_points(heat: np.ndarray) -> np.ndarray:
     return np.asarray(pts, dtype=np.float32)
 
 
-def soft_argmax_points(heat_logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+def soft_argmax_points(
+    heat_logits: torch.Tensor, temperature: float = 1.0
+) -> torch.Tensor:
     b, c, h, w = heat_logits.shape
     flat = heat_logits.view(b, c, -1) / max(temperature, 1e-6)
     prob = F.softmax(flat, dim=-1)
@@ -402,19 +575,106 @@ def soft_argmax_points(heat_logits: torch.Tensor, temperature: float = 1.0) -> t
     return torch.einsum("bck,dk->bcd", prob, coords)
 
 
+def decode_points(logits: torch.Tensor, mode: str = "local") -> torch.Tensor:
+    """Peak detector (Fig.5), refined only within a 5x5 neighbourhood.
+
+    Local decoding avoids averaging distant peaks or a large background region.
+    The spatial classification loss also makes global soft-argmax well defined.
+    """
+    if mode == "soft":
+        return soft_argmax_points(logits)
+    b, c, h, w = logits.shape
+    peak = logits.reshape(b, c, -1).argmax(-1)
+    x, y = peak % w, peak // w
+    if mode == "argmax":
+        return torch.stack([x, y], -1).to(logits.dtype)
+    if mode != "local":
+        raise ValueError(mode)
+    yy = torch.arange(h, device=logits.device)[None, None, :, None]
+    xx = torch.arange(w, device=logits.device)[None, None, None, :]
+    local = (abs(xx - x[..., None, None]) <= 2) & (abs(yy - y[..., None, None]) <= 2)
+    return soft_argmax_points(logits.masked_fill(~local, -1e4))
+
+
+def clean_mask(mask: np.ndarray) -> np.ndarray:
+    """Keep the largest connected roof and fill holes; remove remote clutter."""
+    from scipy import ndimage
+
+    labels, n = ndimage.label(mask > 0)
+    if not n:
+        return np.zeros_like(mask, dtype=np.uint8)
+    counts = np.bincount(labels.ravel())
+    counts[0] = 0
+    return ndimage.binary_fill_holes(labels == counts.argmax()).astype(np.uint8)
+
+
+def enforce_o123_x_order(xy: np.ndarray) -> np.ndarray:
+    """SAR range prior on this dataset: O1.x < O2.x < O3.x.
+
+    Re-label the three predicted peaks by ascending x. Shape (3,2) or (B,3,2).
+    """
+    single = xy.ndim == 2
+    if single:
+        xy = xy[None]
+    out = np.empty_like(xy)
+    for i in range(xy.shape[0]):
+        order = np.argsort(xy[i, :, 0])
+        out[i] = xy[i, order]
+    return out[0] if single else out
+
+
+def area_radius(mask: np.ndarray) -> float:
+    area = float((mask > 0).sum())
+    return float(math.sqrt(area / math.pi)) if area > 0 else 0.0
+
+
+def robust_circle_radius(mask: np.ndarray) -> float:
+    """Fit a circle to the main roof contour, iteratively rejecting outliers.
+
+    A deterministic alternative to Fig.5's Hough detector; no radius shrinking
+    based on keypoint distances. Fall back to area only for degenerate contours.
+    """
+    from scipy import ndimage
+
+    mask = clean_mask(mask)
+    boundary = (mask > 0) & ~ndimage.binary_erosion(mask > 0)
+    y, x = np.nonzero(boundary)
+    if len(x) < 8:
+        return area_radius(mask)
+    pts = np.column_stack([x, y]).astype(np.float64)
+    keep = np.ones(len(pts), dtype=bool)
+    radius = area_radius(mask)
+    for _ in range(5):
+        q = pts[keep]
+        if len(q) < 8:
+            break
+        a = np.column_stack([2 * q[:, 0], 2 * q[:, 1], np.ones(len(q))])
+        sol, _, rank, _ = np.linalg.lstsq(a, (q * q).sum(1), rcond=None)
+        if rank < 3:
+            return area_radius(mask)
+        radius = math.sqrt(max(sol[2] + sol[0] ** 2 + sol[1] ** 2, 0))
+        residual = np.abs(np.linalg.norm(pts - sol[:2], axis=1) - radius)
+        median = np.median(residual)
+        threshold = max(1.0, median + 3 * 1.4826 * np.median(abs(residual - median)))
+        updated = residual <= threshold
+        if np.array_equal(updated, keep):
+            break
+        keep = updated
+    return float(radius)
+
+
 def fit_circle_radius(mask: np.ndarray) -> float:
+    """Legacy unfiltered algebraic fit, retained for comparisons."""
     ys, xs = np.nonzero(mask > 0)
     if len(xs) < 8:
-        area = float(mask.sum())
-        return float(math.sqrt(area / math.pi)) if area > 0 else 0.0
+        return area_radius(mask)
     pad = np.pad(mask > 0, 1, mode="constant")
     edge = []
     for y, x in zip(ys, xs, strict=False):
         if pad[y : y + 3, x : x + 3].min() == 0:
             edge.append((x, y))
     if len(edge) < 8:
-        area = float(mask.sum())
-        return float(math.sqrt(area / math.pi)) if area > 0 else 0.0
+        return area_radius(mask)
     pts = np.asarray(edge, dtype=np.float64)
     x, y = pts[:, 0], pts[:, 1]
     A = np.column_stack([2 * x, 2 * y, np.ones_like(x)])
@@ -424,8 +684,36 @@ def fit_circle_radius(mask: np.ndarray) -> float:
         cx, cy, c = sol
         return float(math.sqrt(max(c + cx * cx + cy * cy, 0.0)))
     except np.linalg.LinAlgError:
-        area = float(mask.sum())
-        return float(math.sqrt(area / math.pi)) if area > 0 else 0.0
+        return area_radius(mask)
+
+
+def resolve_radius(
+    mask: np.ndarray,
+    r_gt: float,
+    mode: str,
+    d13: float | None = None,
+) -> float:
+    """Choose radius without using keypoints to force a valid volume."""
+    if mode == "gt":
+        return float(r_gt)
+    if mode == "robust":
+        return robust_circle_radius(mask)
+    if mode == "fit":
+        r = fit_circle_radius(mask)
+    elif mode == "area":
+        r = area_radius(mask)
+    elif mode == "auto":
+        r_area = area_radius(mask)
+        r_fit = fit_circle_radius(mask)
+        # boundary fit often overestimates on noisy SAR masks; take the smaller.
+        r = min(r_area, r_fit) if r_fit > 0 else r_area
+        if d13 is not None and d13 <= r and r_area > 0:
+            # last resort: shrink toward making h>=0 is wrong physically;
+            # keep geometric r but caller will still clamp h.
+            r = min(r, r_area)
+    else:
+        raise ValueError(f"unknown radius mode: {mode}")
+    return float(r)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +723,8 @@ def fit_circle_radius(mask: np.ndarray) -> float:
 
 def dice_loss_with_logits(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     probs = F.softmax(logits, dim=1)[:, 1]
-    tgt = target.float()
+    probs = probs * (target != -100)
+    tgt = (target == 1).float()
     inter = (probs * tgt).sum(dim=(1, 2))
     union = probs.sum(dim=(1, 2)) + tgt.sum(dim=(1, 2))
     return 1.0 - ((2 * inter + 1e-6) / (union + 1e-6)).mean()
@@ -446,22 +735,62 @@ def multitask_loss(
     mask: torch.Tensor,
     heatmaps: torch.Tensor,
     lambda_kp: float = 1.0,
+    kp_channel_weights: tuple[float, float, float] = (1.0, 1.0, 2.0),
+    lambda_coord: float = 1.0,
+    points: torch.Tensor | None = None,
+    kp_valid: torch.Tensor | None = None,
+    lambda_geom: float = 1.0,
 ) -> torch.Tensor:
-    """Supervised loss on mask + keypoints only (no volume / no meta)."""
+    """Spatial distribution CE + normalized coordinate/distance supervision.
+
+    Unlike dense sigmoid MSE, background pixels cannot overwhelm a tiny peak.
+    Geometry loss supervises measured distances, not an assumed x-order or
+    a manufactured positive volume. No test metadata is used in training.
+    """
     seg = F.cross_entropy(out["seg_logits"], mask) + dice_loss_with_logits(
         out["seg_logits"], mask
     )
-    kp = F.mse_loss(torch.sigmoid(out["kp_heatmaps"]), heatmaps)
-    return seg + lambda_kp * kp
+    logits = out["kp_heatmaps"]
+    target = heatmaps.flatten(2)
+    target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
+    weight = logits.new_tensor(kp_channel_weights)[None]
+    if kp_valid is not None:
+        weight = weight * kp_valid
+    ce = -(target * F.log_softmax(logits.flatten(2), dim=-1)).sum(-1)
+    kp = (ce * weight).sum() / weight.expand_as(ce).sum().clamp_min(1)
+    pred_xy = soft_argmax_points(logits)
+    gt_xy = (
+        points
+        if points is not None
+        else soft_argmax_points(heatmaps.clamp_min(1e-8).log())
+    )
+    size = logits.shape[-1]
+    coord_err = ((pred_xy - gt_xy) / size).abs().mean(-1)
+    coord = (coord_err * weight).sum() / weight.expand_as(coord_err).sum().clamp_min(1)
+    pdist = torch.linalg.vector_norm(pred_xy[:, 1:] - pred_xy[:, :1], dim=-1) / size
+    gdist = torch.linalg.vector_norm(gt_xy[:, 1:] - gt_xy[:, :1], dim=-1) / size
+    pairs = (
+        torch.ones_like(pdist)
+        if kp_valid is None
+        else (kp_valid[:, 1:] & kp_valid[:, :1]).float()
+    )
+    geom = (abs(pdist - gdist) * pairs).sum() / pairs.sum().clamp_min(1)
+    return seg + lambda_kp * kp + lambda_coord * coord + lambda_geom * geom
 
 
 @torch.no_grad()
-def _discover_emb_dim(backbone: nn.Module, patch_size: int, device: torch.device) -> int:
+def _discover_emb_dim(
+    backbone: nn.Module, patch_size: int, device: torch.device
+) -> int:
     m = HHTankGeomModel(backbone, 768, patch_size).to(device)
     return int(m.encode(torch.zeros(1, 2, 64, 64, device=device)).shape[-1])
 
 
-def build_model(args: argparse.Namespace, device: torch.device) -> tuple[nn.Module, dict]:
+def build_model(
+    args: argparse.Namespace, device: torch.device
+) -> tuple[nn.Module, dict]:
+    from olmoearth_pretrain.model_loader import load_model_from_path
+
     if not args.weights:
         raise ValueError("--weights is required (OlmoEarth checkpoint dir)")
     backbone = load_model_from_path(args.weights).to(device)
@@ -472,14 +801,22 @@ def build_model(args: argparse.Namespace, device: torch.device) -> tuple[nn.Modu
         patch_size=args.patch_size,
         mid_dim=args.mid_dim,
         decoder_depth=args.decoder_depth,
+        detail_branch=args.detail_branch,
     ).to(device)
     return model, {"emb_dim": emb_dim, "patch_size": args.patch_size}
 
 
 def train(args: argparse.Namespace) -> None:
+    if not 0 < args.val_fraction < 1:
+        raise ValueError("--val-fraction must lie between 0 and 1")
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if (out_dir / "best.pt").exists() or (out_dir / "last.pt").exists():
+        raise FileExistsError(f"Use a new --out-dir to preserve checkpoints: {out_dir}")
 
     model, model_meta = build_model(args, device)
     optim = torch.optim.AdamW(
@@ -488,8 +825,31 @@ def train(args: argparse.Namespace) -> None:
         weight_decay=1e-4,
     )
 
-    train_ds = TankGeomDataset(Path(args.data_root), "train", args.size)
-    val_ds = TankGeomDataset(Path(args.data_root), "test", args.size)
+    full_ds = TankGeomDataset(Path(args.data_root), "train", args.size)
+    if len(full_ds) < 2:
+        raise ValueError("Need at least two training images for a holdout")
+    indices = np.random.default_rng(args.seed).permutation(len(full_ds)).tolist()
+    if args.val_list:
+        names = {
+            s.strip() for s in Path(args.val_list).read_text().splitlines() if s.strip()
+        }
+        known = {p.name for p in full_ds.paths}
+        if names - known:
+            raise ValueError(f"Unknown validation names: {sorted(names-known)}")
+        val_idx = [i for i in indices if full_ds.paths[i].name in names]
+        train_idx = [i for i in indices if full_ds.paths[i].name not in names]
+    else:
+        n_val = max(1, min(len(full_ds) - 1, round(len(full_ds) * args.val_fraction)))
+        val_idx, train_idx = indices[:n_val], indices[n_val:]
+    if not train_idx or not val_idx:
+        raise ValueError("Training and validation subsets must both be nonempty")
+    train_ds, val_ds = Subset(full_ds, train_idx), Subset(full_ds, val_idx)
+    split_manifest = {
+        "seed": args.seed,
+        "train": [full_ds.paths[i].name for i in train_idx],
+        "val": [full_ds.paths[i].name for i in val_idx],
+    }
+    (out_dir / "split.json").write_text(json.dumps(split_manifest, indent=2))
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers
     )
@@ -499,11 +859,18 @@ def train(args: argparse.Namespace) -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         f"encoder=OlmoEarth(frozen) emb_dim={model_meta['emb_dim']} "
-        f"trainable={n_params:,} train={len(train_ds)} val={len(val_ds)} "
-        f"(supervise mask+kp only; volume is post-process)"
+        f"trainable={n_params:,} train={len(train_ds)} val={len(val_ds)}"
     )
 
     best = -1e9
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
+    loss_options = {
+        "lambda_kp": args.lambda_kp,
+        "lambda_coord": args.lambda_coord,
+        "lambda_geom": args.lambda_geom,
+        "kp_channel_weights": (1.0, 1.0, args.o3_weight),
+    }
+    history = []
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
@@ -513,14 +880,27 @@ def train(args: argparse.Namespace) -> None:
             masks = batch["mask"].to(device)
             heats = batch["heatmaps"].to(device)
             out = model(images)
-            loss = multitask_loss(out, masks, heats, args.lambda_kp)
+            loss = multitask_loss(
+                out,
+                masks,
+                heats,
+                points=batch["points"].to(device),
+                kp_valid=batch["kp_valid"].to(device),
+                **loss_options,
+            )
             optim.zero_grad(set_to_none=True)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], max_norm=5.0
+            )
             optim.step()
             running += float(loss.item()) * images.size(0)
             n += images.size(0)
 
-        metrics = evaluate(model, val_loader, device)
+        metrics = evaluate(model, val_loader, device, loss_options=loss_options)
+        scheduler.step()
+        history.append({"epoch": epoch, "train_loss": running / max(n, 1), **metrics})
+        (out_dir / "history.json").write_text(json.dumps(history, indent=2))
         print(
             f"epoch {epoch}: train_loss={running / max(n, 1):.4f}  "
             f"val_loss={metrics['loss']:.4f}  miou={metrics['miou']:.4f}  "
@@ -536,9 +916,19 @@ def train(args: argparse.Namespace) -> None:
             "proj": model.proj.state_dict(),
             "head": model.head.state_dict(),
             "metrics": metrics,
+            "format_version": 2,
+            "preprocess": "letterbox",
+            "detail_branch": args.detail_branch,
+            "decode": "local",
+            "formula": "paper",
+            "loss_options": loss_options,
+            "training_args": vars(args),
+            "split_manifest": split_manifest,
         }
         torch.save(ckpt, out_dir / "last.pt")
-        score = metrics["miou"] - 0.01 * metrics["kp_px_err"]
+        score = metrics["miou"] - 0.01 * (
+            metrics["kp_px_err"] + metrics["radius_px_mae"] + metrics["d13_px_mae"]
+        )
         if score > best:
             best = score
             torch.save(ckpt, out_dir / "best.pt")
@@ -550,6 +940,10 @@ def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    decode: str = "local",
+    radius_mode: str = "robust",
+    loss_options: dict | None = None,
+    order_by_x: bool = False,
 ) -> dict[str, float]:
     """Val metrics for supervised tasks only (no volume)."""
     model.eval()
@@ -557,12 +951,27 @@ def evaluate(
     n = 0
     seg_preds, seg_labs = [], []
     kp_errs: list[float] = []
+    per_point = []
+    radius_errs, distance_errs = [], []
+    invalid_geometry = 0
+    gt_invalid_geometry = 0
+    incomplete_labels = 0
+    dataset = (
+        loader.dataset.dataset if isinstance(loader.dataset, Subset) else loader.dataset
+    )
     for batch in tqdm(loader, desc="eval", leave=False):
         images = batch["image"].to(device)
         masks = batch["mask"].to(device)
         heats = batch["heatmaps"].to(device)
         out = model(images)
-        loss = multitask_loss(out, masks, heats)
+        loss = multitask_loss(
+            out,
+            masks,
+            heats,
+            points=batch["points"].to(device),
+            kp_valid=batch["kp_valid"].to(device),
+            **(loss_options or {}),
+        )
         bs = images.size(0)
         total_loss += float(loss.item()) * bs
         n += bs
@@ -571,15 +980,49 @@ def evaluate(
         seg_preds.extend(list(pred))
         seg_labs.extend(list(masks.cpu().numpy()))
 
-        pred_xy = soft_argmax_points(out["kp_heatmaps"]).cpu().numpy()
-        gt_h = heats.cpu().numpy()
+        pred_xy = (
+            decode_points(
+                out["kp_heatmaps"].masked_fill((masks == -100)[:, None], -1e4), decode
+            )
+            .cpu()
+            .numpy()
+        )
+        if order_by_x:
+            pred_xy = enforce_o123_x_order(pred_xy)
         for i in range(bs):
-            pp = pred_xy[i]
-            gp = heatmaps_to_points(gt_h[i])
-            kp_errs.append(float(np.linalg.norm(pp - gp, axis=1).mean()))
+            scale = float(batch["scale"][i])
+            offset = batch["offset"][i].numpy()
+            pp = (pred_xy[i] - offset) / scale
+            gp = (batch["points"][i].numpy() - offset) / scale
+            errors = np.linalg.norm(pp - gp, axis=1)
+            labelled = batch["kp_valid"][i].numpy()
+            errors[~labelled] = np.nan
+            per_point.append(errors)
+            if labelled.any():
+                kp_errs.append(float(np.nanmean(errors)))
+            incomplete_labels += not labelled.all()
+            original_mask = restore_mask(
+                pred[i], tuple(batch["original_shape"][i].tolist()), dataset.preprocess
+            )
+            radius = resolve_radius(
+                original_mask, float(batch["r_mask_px"][i]), radius_mode
+            )
+            gt_radius = float(batch["r_mask_px"][i])
+            radius_errs.append(abs(radius - gt_radius))
+            d12, d13 = np.linalg.norm(pp[0] - pp[1]), np.linalg.norm(pp[0] - pp[2])
+            gd12, gd13 = np.linalg.norm(gp[0] - gp[1]), np.linalg.norm(gp[0] - gp[2])
+            if labelled[0] and labelled[2]:
+                distance_errs.append(abs(d13 - gd13))
+            invalid_geometry += not (radius > 0 and 0 <= d13 - 2 * radius <= d12)
+            if labelled.all():
+                gt_invalid_geometry += not (
+                    gt_radius > 0 and 0 <= gd13 - 2 * gt_radius <= gd12
+                )
 
     flat_p = np.concatenate([p.reshape(-1) for p in seg_preds])
     flat_l = np.concatenate([l.reshape(-1) for l in seg_labs])
+    valid = flat_l != -100
+    flat_p, flat_l = flat_p[valid], flat_l[valid]
     ious = []
     for c in (0, 1):
         tp = int(((flat_p == c) & (flat_l == c)).sum())
@@ -590,6 +1033,15 @@ def evaluate(
         "loss": total_loss / max(n, 1),
         "miou": float(np.mean(ious)),
         "kp_px_err": float(np.mean(kp_errs)) if kp_errs else 0.0,
+        "O1_px_err": float(np.nanmean(np.asarray(per_point)[:, 0])),
+        "O2_px_err": float(np.nanmean(np.asarray(per_point)[:, 1])),
+        "O3_px_err": float(np.nanmean(np.asarray(per_point)[:, 2])),
+        "radius_px_mae": float(np.mean(radius_errs)),
+        "d13_px_mae": float(np.mean(distance_errs)) if distance_errs else float("nan"),
+        "paper_invalid_geometry_rate": invalid_geometry / max(n, 1),
+        "paper_gt_invalid_geometry_rate": gt_invalid_geometry
+        / max(n - incomplete_labels, 1),
+        "incomplete_keypoint_labels": incomplete_labels,
     }
 
 
@@ -610,9 +1062,21 @@ def _build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--out-dir", required=True)
     tr.add_argument("--mid-dim", type=int, default=256)
     tr.add_argument("--decoder-depth", type=int, default=3)
-    tr.add_argument("--epochs", type=int, default=30)
-    tr.add_argument("--lr", type=float, default=1e-3)
-    tr.add_argument("--lambda-kp", type=float, default=5.0)
+    tr.add_argument("--epochs", type=int, default=80)
+    tr.add_argument("--lr", type=float, default=3e-4)
+    tr.add_argument("--lambda-kp", type=float, default=1.0)
+    tr.add_argument("--lambda-coord", type=float, default=1.0)
+    tr.add_argument("--lambda-geom", type=float, default=1.0)
+    tr.add_argument("--o3-weight", type=float, default=2.0)
+    tr.add_argument(
+        "--detail-branch", action=argparse.BooleanOptionalAction, default=True
+    )
+    tr.add_argument("--seed", type=int, default=42)
+    tr.add_argument("--val-fraction", type=float, default=0.15)
+    tr.add_argument(
+        "--val-list",
+        help="Optional train filenames, one per line, for a grouped holdout",
+    )
 
     ev = sub.add_parser("eval", help="Eval mask/kp; optional volume with --meta")
     add_shared(ev)
@@ -626,11 +1090,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Imaging meta .xlsx/.csv (Sr, incidence). Needed for R/H/h/V columns",
     )
     ev.add_argument(
-        "--pred-radius",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Fit R_mask from predicted mask; else use GT circle",
+        "--radius-mode",
+        choices=("robust", "auto", "area", "fit", "gt"),
+        default="robust",
+        help="robust=main component contour; gt=diagnostic label radius (not deployable)",
     )
+    ev.add_argument(
+        "--order-by-x",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Re-label O1/O2/O3 by ascending x (SAR range prior)",
+    )
+    ev.add_argument(
+        "--decode",
+        choices=("local", "argmax", "soft"),
+        default=None,
+        help="Defaults to checkpoint mode; old checkpoints use soft for reproducibility",
+    )
+    ev.add_argument("--formula", choices=("paper", "legacy"), default="paper")
     ev.add_argument(
         "--save-preds",
         default=None,
@@ -641,6 +1118,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 @torch.no_grad()
 def eval_only(args: argparse.Namespace) -> None:
+    import rasterio
+    from olmoearth_pretrain.model_loader import load_model_from_path
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     backbone = load_model_from_path(args.weights).to(device)
@@ -650,19 +1130,40 @@ def eval_only(args: argparse.Namespace) -> None:
         patch_size=int(ckpt.get("patch_size", args.patch_size)),
         mid_dim=int(ckpt.get("mid_dim", 256)),
         decoder_depth=int(ckpt.get("decoder_depth", 3)),
+        detail_branch=bool(ckpt.get("detail_branch", False)),
     ).to(device)
     model.proj.load_state_dict(ckpt["proj"])
     model.head.load_state_dict(ckpt["head"])
+    preprocess = ckpt.get("preprocess", "legacy")
+    decode = args.decode or ckpt.get("decode", "soft")
+    if preprocess == "legacy":
+        warnings.warn(
+            "Legacy checkpoint: retaining centre crop and old normalization. "
+            "Retrain for full-image letterbox and the detail branch."
+        )
+    if args.order_by_x:
+        warnings.warn(
+            "Sorting changes keypoint identities and is not a universal SAR prior."
+        )
 
     ds = TankGeomDataset(
         Path(args.data_root),
         args.split,
         size=int(ckpt.get("size", args.size)),
+        preprocess=preprocess,
     )
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers
     )
-    metrics = evaluate(model, loader, device)
+    metrics = evaluate(
+        model,
+        loader,
+        device,
+        decode=decode,
+        radius_mode=args.radius_mode,
+        loss_options=ckpt.get("loss_options"),
+        order_by_x=args.order_by_x,
+    )
     print(json.dumps(metrics, indent=2))
 
     if args.save_preds is None:
@@ -671,17 +1172,36 @@ def eval_only(args: argparse.Namespace) -> None:
     meta = load_meta(Path(args.meta) if args.meta else None)
     pred_dir = Path(args.save_preds)
     pred_dir.mkdir(parents=True, exist_ok=True)
+    if (pred_dir / "volumes.csv").exists():
+        raise FileExistsError(f"Use a new --save-preds directory: {pred_dir}")
     rows: list[dict[str, object]] = []
     skipped_meta = 0
+    n_zero_h = 0
+    volume_errors = []
+    gt_geometry_invalid = 0
     model.eval()
     for batch in tqdm(loader, desc="save"):
         images = batch["image"].to(device)
         out = model(images)
         masks = out["seg_logits"].argmax(1).cpu().numpy().astype(np.uint8)
-        xy = soft_argmax_points(out["kp_heatmaps"]).cpu().numpy()
+        xy = (
+            decode_points(
+                out["kp_heatmaps"].masked_fill(
+                    (batch["mask"].to(device) == -100)[:, None], -1e4
+                ),
+                decode,
+            )
+            .cpu()
+            .numpy()
+        )
+        if args.order_by_x:
+            xy = enforce_o123_x_order(xy)
         r_gt = batch["r_mask_px"].numpy()
         for i, name in enumerate(batch["name"]):
-            m = masks[i]
+            shape = tuple(batch["original_shape"][i].tolist())
+            m = restore_mask(masks[i], shape, preprocess)
+            if args.radius_mode == "robust":
+                m = clean_mask(m)
             with rasterio.open(
                 pred_dir / name,
                 "w",
@@ -693,54 +1213,114 @@ def eval_only(args: argparse.Namespace) -> None:
             ) as dst:
                 dst.write(m * 255, 1)
 
+            scale = float(batch["scale"][i])
+            offset = batch["offset"][i].numpy()
+            o1, o2, o3 = (xy[i] - offset) / scale
+            d13 = float(np.linalg.norm(o1 - o3))
+            r_use = resolve_radius(m, float(r_gt[i]), args.radius_mode, d13=d13)
             row: dict[str, object] = {
                 "filename": name,
                 "split": args.split,
-                "O1_x": float(xy[i, 0, 0]),
-                "O1_y": float(xy[i, 0, 1]),
-                "O2_x": float(xy[i, 1, 0]),
-                "O2_y": float(xy[i, 1, 1]),
-                "O3_x": float(xy[i, 2, 0]),
-                "O3_y": float(xy[i, 2, 1]),
+                "O1_x": float(o1[0]),
+                "O1_y": float(o1[1]),
+                "O2_x": float(o2[0]),
+                "O2_y": float(o2[1]),
+                "O3_x": float(o3[0]),
+                "O3_y": float(o3[1]),
+                "R_mask_px": r_use,
+                "d13_px": d13,
+                "coordinate_space": "original_image_pixels",
+                "preprocess": preprocess,
+                "decode": decode,
+                "radius_mode": args.radius_mode,
             }
             mmeta = lookup_meta(meta, args.split, name) if meta else None
             if mmeta is None:
                 skipped_meta += 1
+                row.update(
+                    {
+                        "geometry_valid": False,
+                        "geometry_status": "missing_meta",
+                        "formula": args.formula,
+                        "V_m3": float("nan"),
+                    }
+                )
                 rows.append(row)
                 continue
-            r_use = fit_circle_radius(m) if args.pred_radius else float(r_gt[i])
             geom = volume_from_geometry(
-                xy[i, 0],
-                xy[i, 1],
-                xy[i, 2],
+                o1,
+                o2,
+                o3,
                 r_use,
                 float(mmeta["pixel_resolution"]),
                 float(mmeta["incidenceangle"]),
+                formula=args.formula,
             )
-            row["R_mask_px"] = r_use
+            if not geom["geometry_valid"]:
+                n_zero_h += 1
             row["sr"] = mmeta["pixel_resolution"]
             row["delta_deg"] = mmeta["incidenceangle"]
             row.update(geom)
+            gt_points = (batch["points"][i].numpy() - offset) / scale
+            gt_geom = volume_from_geometry(
+                *gt_points,
+                float(r_gt[i]),
+                float(mmeta["pixel_resolution"]),
+                float(mmeta["incidenceangle"]),
+                formula=args.formula,
+            )
+            if not bool(batch["kp_valid"][i].all()):
+                gt_geom.update({"geometry_valid": False, "V_m3": float("nan")})
+            row["GT_V_m3"] = gt_geom["V_m3"]
+            row["GT_geometry_valid"] = gt_geom["geometry_valid"]
+            gt_geometry_invalid += not gt_geom["geometry_valid"]
+            if geom["geometry_valid"] and gt_geom["geometry_valid"]:
+                volume_errors.append(float(geom["V_m3"]) - float(gt_geom["V_m3"]))
             rows.append(row)
 
     pd.DataFrame(rows).to_csv(pred_dir / "volumes.csv", index=False)
+    print(
+        f"wrote {pred_dir}  radius_mode={args.radius_mode}  "
+        f"order_by_x={args.order_by_x}  invalid_geometry={n_zero_h}/{len(rows)}"
+    )
+    metrics.update(
+        {
+            "n_predictions": len(rows),
+            "missing_meta": skipped_meta,
+            "invalid_geometry": n_zero_h,
+            "gt_invalid_geometry": gt_geometry_invalid,
+            "valid_volume_pairs": len(volume_errors),
+            "volume_mae_valid_pairs_m3": (
+                float(np.mean(np.abs(volume_errors))) if volume_errors else None
+            ),
+            "volume_rmse_valid_pairs_m3": (
+                float(np.sqrt(np.mean(np.square(volume_errors))))
+                if volume_errors
+                else None
+            ),
+            "formula": args.formula,
+            "decode": decode,
+            "preprocess": preprocess,
+        }
+    )
+    (pred_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     if not meta:
-        print(
-            f"wrote masks to {pred_dir}; volumes.csv has keypoints only "
-            f"(pass --meta meta.xlsx to compute R/H/h/V)"
-        )
+        print("volumes.csv has keypoints only (pass --meta to compute R/H/h/V)")
     elif skipped_meta:
-        print(
-            f"wrote preds to {pred_dir}; {skipped_meta}/{len(rows)} rows "
-            f"missing meta (no volume for those)"
-        )
-    else:
-        print(f"wrote preds + full volumes.csv to {pred_dir}")
+        print(f"{skipped_meta}/{len(rows)} rows missing meta")
 
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if (
+        args.size <= 0
+        or args.patch_size not in (1, 2, 4, 8)
+        or args.size % args.patch_size
+    ):
+        raise ValueError("size must be positive and divisible by patch-size (1,2,4,8)")
     if args.cmd == "train":
+        if args.epochs < 1 or args.lr <= 0:
+            raise ValueError("epochs and learning rate must be positive")
         train(args)
     elif args.cmd == "eval":
         eval_only(args)
