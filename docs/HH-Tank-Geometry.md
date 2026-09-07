@@ -44,9 +44,9 @@ Sr、入射角沿用 `meta.xlsx` 中的 `pixel_resolution`、`incidenceangle`。
 - 默认半径由最大连通屋顶、孔洞填充和迭代剔除离群点的圆拟合获得。
   它是论文 Hough 检测器的确定性替代方案，不根据关键点距离强行缩小半径。
   `--radius-mode area/fit/auto` 保留对照；`gt` 仅用于定位误差来源，不能作为部署性能。
-- 从 `train` 内部划出固定验证集，保存 `split.json`；不使用 `test` 选最佳权重。
-  默认按样本随机划分，不能证明跨场景泛化。同一罐/同一场景应放在同一子集，
-  可用 `--val-list validation_filenames.txt` 指定来自 train 的验证文件名，每行一个。
+- 使用全部 `train` 样本训练，每轮在全部 `test` 样本上验证并选择最佳权重，
+  不再额外划分验证集。`split.json` 仅记录实际使用的 train/test 文件清单。
+  这里的 test 同时承担模型选择，因此其结果不是独立留出测试成绩。
 - 梯度裁剪、余弦学习率；checkpoint 保存结构、预处理、解码、损失和划分配置。
   最佳权重依据验证 mIoU、关键点、半径和 d13 误差联合选择。
 
@@ -66,7 +66,7 @@ python scripts/tools/train_hh_tank_geom.py train \
   --data-root "$TANK_DATA" --weights "$TANK_WEIGHTS" \
   --out-dir runs/tank_geom_v2 \
   --size 128 --patch-size 4 --batch-size 2 --workers 4 \
-  --epochs 80 --lr 0.0003 --seed 42 --val-fraction 0.15
+  --epochs 80 --lr 0.0003 --seed 42
 
 python scripts/tools/train_hh_tank_geom.py eval \
   --data-root "$TANK_DATA" --weights "$TANK_WEIGHTS" \
@@ -90,7 +90,7 @@ python scripts/tools/train_hh_tank_geom.py eval \
 这些体积 GT 来自人工几何标注和同一公式，不是现场独立测得的实际油量。
 
 必须同时报告体积误差与有效覆盖率；仅在少量成功样本上误差低不能说明整体表现好。
-同一份测试集、相同公式、相同半径模式下比较；不要在测试集上反复挑选超参数。
+同一份测试集、相同公式、相同半径模式下比较；注明 test 用于每轮验证和最佳权重选择。
 缺失 metadata 与几何失败单独记录，不填成 0。
 
 已检查本地数据：train 913 张，其中 7 张缺少 O1 或 O3；test 234 张且关键点完整。

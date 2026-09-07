@@ -48,7 +48,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
@@ -807,8 +807,6 @@ def build_model(
 
 
 def train(args: argparse.Namespace) -> None:
-    if not 0 < args.val_fraction < 1:
-        raise ValueError("--val-fraction must lie between 0 and 1")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -825,29 +823,13 @@ def train(args: argparse.Namespace) -> None:
         weight_decay=1e-4,
     )
 
-    full_ds = TankGeomDataset(Path(args.data_root), "train", args.size)
-    if len(full_ds) < 2:
-        raise ValueError("Need at least two training images for a holdout")
-    indices = np.random.default_rng(args.seed).permutation(len(full_ds)).tolist()
-    if args.val_list:
-        names = {
-            s.strip() for s in Path(args.val_list).read_text().splitlines() if s.strip()
-        }
-        known = {p.name for p in full_ds.paths}
-        if names - known:
-            raise ValueError(f"Unknown validation names: {sorted(names-known)}")
-        val_idx = [i for i in indices if full_ds.paths[i].name in names]
-        train_idx = [i for i in indices if full_ds.paths[i].name not in names]
-    else:
-        n_val = max(1, min(len(full_ds) - 1, round(len(full_ds) * args.val_fraction)))
-        val_idx, train_idx = indices[:n_val], indices[n_val:]
-    if not train_idx or not val_idx:
-        raise ValueError("Training and validation subsets must both be nonempty")
-    train_ds, val_ds = Subset(full_ds, train_idx), Subset(full_ds, val_idx)
+    train_ds = TankGeomDataset(Path(args.data_root), "train", args.size)
+    val_ds = TankGeomDataset(Path(args.data_root), "test", args.size)
     split_manifest = {
         "seed": args.seed,
-        "train": [full_ds.paths[i].name for i in train_idx],
-        "val": [full_ds.paths[i].name for i in val_idx],
+        "validation_split": "test",
+        "train": [f"train/{p.name}" for p in train_ds.paths],
+        "val": [f"test/{p.name}" for p in val_ds.paths],
     }
     (out_dir / "split.json").write_text(json.dumps(split_manifest, indent=2))
     train_loader = DataLoader(
@@ -859,7 +841,7 @@ def train(args: argparse.Namespace) -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         f"encoder=OlmoEarth(frozen) emb_dim={model_meta['emb_dim']} "
-        f"trainable={n_params:,} train={len(train_ds)} val={len(val_ds)}"
+        f"trainable={n_params:,} train={len(train_ds)} val(test)={len(val_ds)}"
     )
 
     best = -1e9
@@ -956,9 +938,7 @@ def evaluate(
     invalid_geometry = 0
     gt_invalid_geometry = 0
     incomplete_labels = 0
-    dataset = (
-        loader.dataset.dataset if isinstance(loader.dataset, Subset) else loader.dataset
-    )
+    dataset = loader.dataset
     for batch in tqdm(loader, desc="eval", leave=False):
         images = batch["image"].to(device)
         masks = batch["mask"].to(device)
@@ -1072,11 +1052,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--detail-branch", action=argparse.BooleanOptionalAction, default=True
     )
     tr.add_argument("--seed", type=int, default=42)
-    tr.add_argument("--val-fraction", type=float, default=0.15)
-    tr.add_argument(
-        "--val-list",
-        help="Optional train filenames, one per line, for a grouped holdout",
-    )
 
     ev = sub.add_parser("eval", help="Eval mask/kp; optional volume with --meta")
     add_shared(ev)

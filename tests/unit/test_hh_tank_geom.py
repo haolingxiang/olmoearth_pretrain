@@ -156,15 +156,17 @@ class TankGeometryTests(unittest.TestCase):
         self.assertEqual(float(logits.grad[0, 2].abs().sum()), 0.0)
         self.assertGreater(float(logits.grad[0, 0].abs().sum()), 0.0)
 
-    def test_training_holdout_and_checkpoint(self):
+    def test_training_uses_full_train_and_test_validation(self):
+        loaded_splits = []
+
         class TinyDataset(torch.utils.data.Dataset):
             preprocess = "letterbox"
 
             def __init__(self, root, split, size, preprocess="letterbox"):
                 self.paths = [Path(f"tank{i}.tif") for i in range(4)]
                 self.size = size
-                if split != "train":
-                    raise AssertionError("Training must not load the test split")
+                self.split = split
+                loaded_splits.append(split)
 
             def __len__(self):
                 return len(self.paths)
@@ -188,7 +190,7 @@ class TankGeometryTests(unittest.TestCase):
                     "offset": torch.tensor([0.0, 0.0]),
                     "original_shape": torch.tensor([32, 32]),
                     "name": self.paths[i].name,
-                    "split": "train",
+                    "split": self.split,
                 }
 
         stub = SimpleNamespace(
@@ -227,7 +229,10 @@ class TankGeometryTests(unittest.TestCase):
             checkpoint = torch.load(Path(tmp) / "best.pt", weights_only=False)
             self.assertEqual(checkpoint["preprocess"], "letterbox")
             manifest = checkpoint["split_manifest"]
-            self.assertFalse(set(manifest["train"]) & set(manifest["val"]))
+            self.assertEqual(loaded_splits, ["train", "test"])
+            self.assertEqual(manifest["validation_split"], "test")
+            self.assertEqual(manifest["train"], [f"train/tank{i}.tif" for i in range(4)])
+            self.assertEqual(manifest["val"], [f"test/tank{i}.tif" for i in range(4)])
             self.assertTrue((Path(tmp) / "history.json").exists())
 
             class MaskWriter:
