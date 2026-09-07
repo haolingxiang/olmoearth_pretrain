@@ -14,7 +14,7 @@ NOT supervised::
 Pipeline::
 
     tokens -> DualTaskHead -> mask + kp heatmaps
-    optional meta-csv -> R,H,h,V  (eval / --save-preds only)
+    optional --meta (.xlsx/.csv) -> R,H,h,V  (eval / --save-preds only)
 
 Example::
 
@@ -27,7 +27,7 @@ Example::
     # eval + volume: pass meta
     python scripts/tools/train_hh_tank_geom.py eval \\
       --ckpt runs/tank_geom/best.pt --weights ... --data-root ... \\
-      --meta-csv .../tank_meta.csv --save-preds pred_test
+      --meta .../test/meta.xlsx --save-preds pred_test
 """
 
 from __future__ import annotations
@@ -308,15 +308,26 @@ class TankGeomDataset(Dataset):
         }
 
 
-def load_meta_csv(path: Path | None) -> dict[str, dict[str, float]]:
+def load_meta(path: Path | None) -> dict[str, dict[str, float]]:
     """Map filename (and optional split/filename) -> imaging meta.
 
-    CSV columns: filename, pixel_resolution, incidenceangle [, split]
+    Accepts ``.csv`` or ``.xlsx``. Required columns:
+    ``filename``, ``pixel_resolution``, ``incidenceangle``; optional ``split``.
     Prefer ``split/filename`` when ``split`` exists (avoids train/test collisions).
     """
     if path is None or not path.is_file():
         return {}
-    df = pd.read_csv(path)
+    suf = path.suffix.lower()
+    if suf in {".xlsx", ".xls"}:
+        df = pd.read_excel(path)
+    elif suf == ".csv":
+        df = pd.read_csv(path)
+    else:
+        raise ValueError(f"meta must be .csv/.xlsx, got {path}")
+    needed = {"filename", "pixel_resolution", "incidenceangle"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"meta missing columns {sorted(missing)} in {path}")
     out: dict[str, dict[str, float]] = {}
     has_split = "split" in df.columns
     for _, row in df.iterrows():
@@ -332,6 +343,10 @@ def load_meta_csv(path: Path | None) -> dict[str, dict[str, float]]:
         out[fn] = entry
         out[Path(fn).stem] = entry
     return out
+
+
+# backward-compatible alias
+load_meta_csv = load_meta
 
 
 def lookup_meta(
@@ -599,14 +614,16 @@ def _build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--lr", type=float, default=1e-3)
     tr.add_argument("--lambda-kp", type=float, default=5.0)
 
-    ev = sub.add_parser("eval", help="Eval mask/kp; optional volume with --meta-csv")
+    ev = sub.add_parser("eval", help="Eval mask/kp; optional volume with --meta")
     add_shared(ev)
     ev.add_argument("--ckpt", required=True)
     ev.add_argument("--split", default="test", choices=("train", "test"))
     ev.add_argument(
+        "--meta",
         "--meta-csv",
+        dest="meta",
         default=None,
-        help="Imaging meta for volume (Sr, incidence). Needed for R/H/h/V columns",
+        help="Imaging meta .xlsx/.csv (Sr, incidence). Needed for R/H/h/V columns",
     )
     ev.add_argument(
         "--pred-radius",
@@ -617,7 +634,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ev.add_argument(
         "--save-preds",
         default=None,
-        help="Dir for mask GeoTIFFs; volumes.csv gets V only if --meta-csv is set",
+        help="Dir for mask GeoTIFFs; volumes.csv gets V only if --meta is set",
     )
     return p
 
@@ -651,7 +668,7 @@ def eval_only(args: argparse.Namespace) -> None:
     if args.save_preds is None:
         return
 
-    meta = load_meta_csv(Path(args.meta_csv) if args.meta_csv else None)
+    meta = load_meta(Path(args.meta) if args.meta else None)
     pred_dir = Path(args.save_preds)
     pred_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
@@ -710,7 +727,7 @@ def eval_only(args: argparse.Namespace) -> None:
     if not meta:
         print(
             f"wrote masks to {pred_dir}; volumes.csv has keypoints only "
-            f"(pass --meta-csv to compute R/H/h/V)"
+            f"(pass --meta meta.xlsx to compute R/H/h/V)"
         )
     elif skipped_meta:
         print(
