@@ -6,7 +6,7 @@ images, Hough visualisations or temporary spreadsheets.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import math
 from pathlib import Path
 import re
@@ -19,6 +19,8 @@ import numpy as np
 IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 SHADOW_NAME_RE = re.compile(r"^(?P<tank>.+)_(?P<mode>[LNR])$", re.IGNORECASE)
 LEGACY_SHADOW_TOLERANCE_PX = 5.0
+DEFAULT_MIN_TANK_HEIGHT_M = 8.0
+DEFAULT_MAX_TANK_HEIGHT_M = 25.0
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,8 @@ class ShadowGeometry:
     inner_edge_points: int
     outer_arc_score: int = 0
     inner_arc_score: int = 0
+    quality_score: float = 0.0
+    selection_reason: str = ""
 
 
 def optical_height_factor(metadata: OpticalMetadata) -> float:
@@ -71,6 +75,8 @@ def calculate_volume(
     circle: CircleGeometry,
     shadow: ShadowGeometry,
     metadata: OpticalMetadata,
+    min_tank_height_m: float = DEFAULT_MIN_TANK_HEIGHT_M,
+    max_tank_height_m: float = DEFAULT_MAX_TANK_HEIGHT_M,
 ) -> dict[str, float | bool | str]:
     """Legacy physical model: the XML ImageRowGSD is the shared pixel scale."""
     scale = metadata.row_gsd_m
@@ -84,16 +90,20 @@ def calculate_volume(
     # The legacy pipeline accepts Lin up to 5 px above Lex and treats that
     # case as an empty tank (zero oil-column height), not a missing result.
     oil_height_m = max(0.0, raw_oil_height_m)
+    height_plausible = min_tank_height_m <= tank_height_m <= max_tank_height_m
     valid = (
         shadow.valid
         and radius_m > 0
         and tank_height_m > 0
         and roof_depth_m >= 0
+        and height_plausible
     )
     max_volume_m3 = math.pi * radius_m**2 * tank_height_m if valid else float("nan")
     volume_m3 = math.pi * radius_m**2 * oil_height_m if valid else float("nan")
     if valid:
         status = "oil_empty" if raw_oil_height_m <= 0 else "ok"
+    elif shadow.valid and not height_plausible:
+        status = "implausible_tank_height"
     else:
         status = shadow.status
     return {
@@ -103,6 +113,7 @@ def calculate_volume(
         "Lin_m": lin_m,
         "tank_height_m": tank_height_m,
         "roof_depth_m": roof_depth_m,
+        "raw_oil_height_m": raw_oil_height_m,
         "oil_height_m": oil_height_m,
         "oil_storage_ratio": oil_height_m / tank_height_m if valid else float("nan"),
         "max_volume_m3": max_volume_m3,
@@ -111,6 +122,7 @@ def calculate_volume(
         "V_10k_bbl": volume_m3 / 1589.8 if valid else float("nan"),
         "geometry_valid": valid,
         "geometry_status": status,
+        "height_plausible": height_plausible,
         "formula": "optical_shadow_eq1_2",
     }
 
@@ -434,8 +446,115 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def shadow_height_m(shadow: ShadowGeometry, metadata: OpticalMetadata) -> float:
+    """Convert the external shadow length to tank height in metres."""
+    return shadow.lex_px * metadata.row_gsd_m / optical_height_factor(metadata)
+
+
+def shadow_plausibility_reason(
+    shadow: ShadowGeometry,
+    metadata: OpticalMetadata,
+    min_tank_height_m: float = DEFAULT_MIN_TANK_HEIGHT_M,
+    max_tank_height_m: float = DEFAULT_MAX_TANK_HEIGHT_M,
+) -> str | None:
+    """Return why a shadow candidate is unusable, or ``None`` when plausible."""
+    if not shadow.valid:
+        return shadow.status
+    if not math.isfinite(shadow.lex_px) or not math.isfinite(shadow.lin_px):
+        return "non_finite_shadow"
+    if shadow.lex_px <= 0 or shadow.lin_px < 0:
+        return "invalid_shadow_length"
+    if shadow.lex_px - shadow.lin_px < -LEGACY_SHADOW_TOLERANCE_PX:
+        return "inner_shadow_exceeds_outer"
+    height_m = shadow_height_m(shadow, metadata)
+    if height_m < min_tank_height_m:
+        return "tank_height_below_min"
+    if height_m > max_tank_height_m:
+        return "tank_height_above_max"
+    return None
+
+
+def _boundary_support_is_reliable(
+    shadow: ShadowGeometry, circle: CircleGeometry
+) -> bool:
+    """Reject boundary fits supported by only a few noisy edge pixels."""
+    minimum = max(6, math.ceil(circle.radius_px * 0.2))
+    if shadow.outer_edge_points < minimum:
+        return False
+    return shadow.lin_px == 0 or shadow.inner_edge_points >= minimum
+
+
+def _shadow_quality(shadow: ShadowGeometry, circle: CircleGeometry) -> float:
+    scale = max(1.0, circle.radius_px * 2.0)
+    if shadow.method == "legacy_boundary_scan":
+        outer = min(1.0, shadow.outer_edge_points / scale)
+        inner = 1.0 if shadow.lin_px == 0 else min(1.0, shadow.inner_edge_points / scale)
+        return 0.6 * outer + 0.4 * inner
+    outer = min(1.0, shadow.outer_arc_score / scale)
+    inner = 1.0 if shadow.lin_px == 0 else min(1.0, shadow.inner_arc_score / scale)
+    return 0.65 * outer + 0.35 * inner
+
+
+def select_shadow_candidate(
+    boundary: ShadowGeometry,
+    arc: ShadowGeometry,
+    circle: CircleGeometry,
+    metadata: OpticalMetadata,
+    min_tank_height_m: float = DEFAULT_MIN_TANK_HEIGHT_M,
+    max_tank_height_m: float = DEFAULT_MAX_TANK_HEIGHT_M,
+) -> ShadowGeometry:
+    """Choose a physically plausible shadow result with sufficient evidence.
+
+    Boundary scanning remains preferred because it is more accurate on this
+    dataset, but it is no longer accepted merely because it returned numbers.
+    Implausible height and weak edge support trigger the arc fallback.
+    """
+    boundary_reason = shadow_plausibility_reason(
+        boundary, metadata, min_tank_height_m, max_tank_height_m
+    )
+    boundary_supported = _boundary_support_is_reliable(boundary, circle)
+    boundary_quality = _shadow_quality(boundary, circle)
+    if boundary_reason is None and boundary_supported:
+        return replace(
+            boundary,
+            quality_score=boundary_quality,
+            selection_reason="boundary_plausible_and_supported",
+        )
+
+    arc_reason = shadow_plausibility_reason(
+        arc, metadata, min_tank_height_m, max_tank_height_m
+    )
+    arc_quality = _shadow_quality(arc, circle)
+    if arc_reason is None:
+        reason = boundary_reason or "boundary_edge_support_too_low"
+        return replace(
+            arc,
+            quality_score=arc_quality,
+            selection_reason=f"arc_fallback:{reason}",
+        )
+
+    if boundary_reason is None:
+        rejected = replace(
+            boundary,
+            valid=False,
+            status="shadow_low_confidence",
+            quality_score=boundary_quality,
+            selection_reason=f"boundary_edge_support_too_low;arc:{arc_reason}",
+        )
+        return rejected
+
+    selected = boundary if boundary_quality >= arc_quality else arc
+    return replace(
+        selected,
+        valid=False,
+        status="shadow_not_plausible",
+        quality_score=max(boundary_quality, arc_quality),
+        selection_reason=f"boundary:{boundary_reason};arc:{arc_reason}",
+    )
+
+
 def _arc_match(
-    rgb: np.ndarray, circle: CircleGeometry, extend_px: int, adjust_px: int
+    rgb: np.ndarray, circle: CircleGeometry, extend_px: int
 ) -> tuple[float, float, int, int]:
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     filtered = cv2.bilateralFilter(gray, 2, 20, 75)
@@ -444,7 +563,9 @@ def _arc_match(
     edge = cv2.addWeighted(gx, 0.1, gy, 0.9, 0)
     _, edge = cv2.threshold(edge, 50, 255, cv2.THRESH_BINARY)
     cx = round(circle.cx_px)
-    base_y = round(circle.cy_px + extend_px - adjust_px)
+    # ``adjust_px`` moves only the crop mask. Applying it again to the arc
+    # origin systematically shifted both matched boundaries in the v2 run.
+    base_y = round(circle.cy_px + extend_px)
     radius = round(circle.radius_px)
 
     def best_offset(
@@ -471,11 +592,14 @@ def _arc_match(
 def measure_shadow(
     rgb: np.ndarray,
     circle: CircleGeometry,
+    metadata: OpticalMetadata,
     extend_px: int,
     overlap_mode: str,
     adjust_px: int = 5,
+    min_tank_height_m: float = DEFAULT_MIN_TANK_HEIGHT_M,
+    max_tank_height_m: float = DEFAULT_MAX_TANK_HEIGHT_M,
 ) -> ShadowGeometry:
-    """Measure external/internal shadow using legacy scan, then arc fallback."""
+    """Measure both shadow boundaries and reject implausible geometry."""
     if circle.radius_px <= 0:
         return ShadowGeometry(0, 0, "none", False, "circle_not_found", 0, 0)
     inside, outside, _ = _split_inner_outer(rgb, circle, extend_px, adjust_px)
@@ -487,7 +611,7 @@ def measure_shadow(
     inner_upper: list[tuple[int, int]] = []
     inner_lower: list[tuple[int, int]] = []
     lex = lin = 0.0
-    valid = False
+    boundary_valid = False
     if out_named is not None:
         out_up, out_down = out_named
         lex = _distance(out_up, out_down)
@@ -499,35 +623,48 @@ def measure_shadow(
                 in_up = min(inner_upper, key=lambda p: abs(p[0] - out_up[0]))
                 in_down = min(inner_lower, key=lambda p: abs(p[0] - out_up[0]))
                 lin = _distance(in_up, in_down)
-        valid = (
+        boundary_valid = (
             out_up[0] != 0
             and out_up[1] > -5
             and lex > 0
             and lin >= 0
             and lex - lin >= -LEGACY_SHADOW_TOLERANCE_PX
         )
-    if valid:
-        return ShadowGeometry(
-            lex, lin, "legacy_boundary_scan", True, "ok", len(out_upper), len(inner_upper)
-        )
-
-    lex, lin, out_score, in_score = _arc_match(rgb, circle, extend_px, adjust_px)
-    valid = (
-        out_score > 0
-        and lex > 0
-        and lin >= 0
-        and lex - lin >= -LEGACY_SHADOW_TOLERANCE_PX
-    )
-    return ShadowGeometry(
+    boundary = ShadowGeometry(
         lex,
         lin,
+        "legacy_boundary_scan",
+        boundary_valid,
+        "ok" if boundary_valid else "boundary_not_found",
+        len(out_upper),
+        len(inner_upper),
+    )
+
+    arc_lex, arc_lin, out_score, in_score = _arc_match(rgb, circle, extend_px)
+    arc_valid = (
+        out_score > 0
+        and arc_lex > 0
+        and arc_lin >= 0
+        and arc_lex - arc_lin >= -LEGACY_SHADOW_TOLERANCE_PX
+    )
+    arc = ShadowGeometry(
+        arc_lex,
+        arc_lin,
         "legacy_arc_match",
-        valid,
-        "ok" if valid else "shadow_not_found",
+        arc_valid,
+        "ok" if arc_valid else "arc_not_found",
         len(out_upper),
         len(inner_upper),
         out_score,
         in_score,
+    )
+    return select_shadow_candidate(
+        boundary,
+        arc,
+        circle,
+        metadata,
+        min_tank_height_m,
+        max_tank_height_m,
     )
 
 

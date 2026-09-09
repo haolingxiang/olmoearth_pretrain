@@ -51,10 +51,10 @@ def discover_dates(data_root: Path, branches: list[str]) -> list[tuple[str, Path
     return dates
 
 
-def candidate_rank(row: dict[str, object]) -> tuple[int, int, int]:
+def candidate_rank(row: dict[str, object]) -> tuple[int, float, int]:
     return (
         int(row.get("geometry_valid") is True),
-        int(row.get("shadow_method") == "legacy_boundary_scan"),
+        float(row.get("shadow_quality_score", 0.0)),
         int(row.get("outer_edge_points", 0))
         + int(row.get("inner_edge_points", 0))
         + int(row.get("outer_arc_score", 0)),
@@ -62,6 +62,8 @@ def candidate_rank(row: dict[str, object]) -> tuple[int, int, int]:
 
 
 def run(args: argparse.Namespace) -> None:
+    if not 0 < args.min_tank_height_m < args.max_tank_height_m:
+        raise ValueError("expected 0 < min_tank_height_m < max_tank_height_m")
     data_root = Path(args.data_root)
     date_dirs = discover_dates(data_root, args.branches)
     if not date_dirs:
@@ -158,9 +160,12 @@ def run(args: argparse.Namespace) -> None:
                         shadow = measure_shadow(
                             read_rgb_u8(shadow_path),
                             circle,
+                            metadata,
                             extend_px,
                             mode,
                             adjust_px=args.circle_adjust_px,
+                            min_tank_height_m=args.min_tank_height_m,
+                            max_tank_height_m=args.max_tank_height_m,
                         )
                         row.update(
                             {
@@ -171,7 +176,15 @@ def run(args: argparse.Namespace) -> None:
                                 "inner_edge_points": shadow.inner_edge_points,
                                 "outer_arc_score": shadow.outer_arc_score,
                                 "inner_arc_score": shadow.inner_arc_score,
-                                **calculate_volume(circle, shadow, metadata),
+                                "shadow_quality_score": shadow.quality_score,
+                                "shadow_selection_reason": shadow.selection_reason,
+                                **calculate_volume(
+                                    circle,
+                                    shadow,
+                                    metadata,
+                                    min_tank_height_m=args.min_tank_height_m,
+                                    max_tank_height_m=args.max_tank_height_m,
+                                ),
                             }
                         )
                     except (OSError, ValueError, cv2.error) as exc:
@@ -202,6 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out-csv", required=True)
     parser.add_argument("--circle-adjust-px", type=int, default=5)
+    parser.add_argument("--min-tank-height-m", type=float, default=8.0)
+    parser.add_argument("--max-tank-height-m", type=float, default=25.0)
     parser.add_argument("--limit", type=int, default=None)
     return parser
 

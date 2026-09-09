@@ -15,6 +15,8 @@ from scripts.tools.optical_tank_geometry import (
     index_tank_pairs,
     parse_optical_metadata,
     read_extend_px,
+    select_shadow_candidate,
+    shadow_plausibility_reason,
     split_shadow_name,
 )
 
@@ -73,6 +75,59 @@ class OpticalTankPipelineTests(unittest.TestCase):
         self.assertEqual(result["oil_storage_ratio"], 0.0)
         self.assertEqual(result["V_m3"], 0.0)
         self.assertAlmostEqual(result["max_volume_m3"], math.pi * 100 * 12, places=4)
+
+    def test_implausible_tank_height_is_not_converted_to_volume(self) -> None:
+        metadata = OpticalMetadata(45, 0, 90, 0, 1.0, 1.0)
+        circle = CircleGeometry(50, 50, 10, "test", 1)
+        shadow = ShadowGeometry(80, 5, "test", True, "ok", 20, 20)
+        result = calculate_volume(circle, shadow, metadata)
+        self.assertFalse(result["geometry_valid"])
+        self.assertEqual(result["geometry_status"], "implausible_tank_height")
+        self.assertTrue(math.isnan(result["V_m3"]))
+
+    def test_implausible_boundary_uses_plausible_arc_fallback(self) -> None:
+        metadata = OpticalMetadata(45, 0, 90, 0, 1.0, 1.0)
+        circle = CircleGeometry(50, 50, 20, "test", 1)
+        boundary = ShadowGeometry(
+            80, 5, "legacy_boundary_scan", True, "ok", 30, 30
+        )
+        arc = ShadowGeometry(
+            15, 5, "legacy_arc_match", True, "ok", 30, 30, 40, 40
+        )
+        selected = select_shadow_candidate(boundary, arc, circle, metadata)
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.method, "legacy_arc_match")
+        self.assertIn("tank_height_above_max", selected.selection_reason)
+
+    def test_weak_boundary_uses_arc_fallback(self) -> None:
+        metadata = OpticalMetadata(45, 0, 90, 0, 1.0, 1.0)
+        circle = CircleGeometry(50, 50, 30, "test", 1)
+        boundary = ShadowGeometry(
+            15, 5, "legacy_boundary_scan", True, "ok", 3, 3
+        )
+        arc = ShadowGeometry(
+            14, 5, "legacy_arc_match", True, "ok", 3, 3, 35, 35
+        )
+        selected = select_shadow_candidate(boundary, arc, circle, metadata)
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.method, "legacy_arc_match")
+        self.assertIn("edge_support", selected.selection_reason)
+
+    def test_plausibility_limits_are_configurable(self) -> None:
+        metadata = OpticalMetadata(45, 0, 90, 0, 1.0, 1.0)
+        shadow = ShadowGeometry(27, 5, "test", True, "ok", 20, 20)
+        self.assertEqual(
+            shadow_plausibility_reason(shadow, metadata),
+            "tank_height_above_max",
+        )
+        self.assertIsNone(
+            shadow_plausibility_reason(
+                shadow,
+                metadata,
+                min_tank_height_m=8,
+                max_tank_height_m=30,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -55,6 +55,7 @@ from olmoearth_pretrain.model_loader import load_model_from_path
 
 try:
     from scripts.tools.optical_tank_geometry import (
+        calculate_volume,
         detect_tank_circle,
         index_tank_pairs,
         measure_shadow,
@@ -65,6 +66,7 @@ try:
     )
 except ModuleNotFoundError:  # direct execution from scripts/tools
     from optical_tank_geometry import (
+        calculate_volume,
         detect_tank_circle,
         index_tank_pairs,
         measure_shadow,
@@ -426,52 +428,6 @@ def decode_boxes(
 # ---------------------------------------------------------------------------
 # Optical volume (paper Eq.1-2)
 # ---------------------------------------------------------------------------
-
-
-def optical_height_factor(
-    solar_elev_deg: float,
-    sat_elev_deg: float,
-    solar_az_deg: float,
-    sat_az_deg: float,
-) -> float:
-    """Denominator of paper Eq.1-2."""
-    a = math.radians(solar_elev_deg)
-    b = math.radians(sat_elev_deg)
-    g = math.radians(solar_az_deg)
-    t = math.radians(sat_az_deg)
-    ca, cb = 1.0 / max(math.tan(a), 1e-6), 1.0 / max(math.tan(b), 1e-6)
-    inside = ca * ca + cb * cb - 2 * ca * cb * math.cos(g - t)
-    return math.sqrt(max(inside, 1e-8))
-
-
-def volume_from_optical(
-    r_m: float,
-    lex_m: float,
-    lin_m: float,
-    solar_elev_deg: float,
-    sat_elev_deg: float,
-    solar_az_deg: float,
-    sat_az_deg: float,
-) -> dict[str, float | bool | str]:
-    denom = optical_height_factor(
-        solar_elev_deg, sat_elev_deg, solar_az_deg, sat_az_deg
-    )
-    H = lex_m / denom
-    h = lin_m / denom
-    oil = H - h
-    valid = r_m > 0 and H > 0 and 0 <= h <= H and oil >= 0
-    v_m3 = math.pi * r_m * r_m * oil if valid else float("nan")
-    return {
-        "R_m": r_m,
-        "H_m": H,
-        "h_m": h,
-        "oil_height_m": oil,
-        "V_m3": v_m3,
-        "V_bbl": v_m3 / 0.158987 if valid else float("nan"),
-        "geometry_valid": valid,
-        "geometry_status": "ok" if valid else "invalid_geometry",
-        "formula": "optical_shadow_eq1_2",
-    }
 
 
 def fit_circle_geometry_px(
@@ -953,11 +909,11 @@ def _find_radius_reference(
     )
 
 
-def _candidate_rank(row: dict[str, object]) -> tuple[int, int, int]:
-    """Prefer a valid boundary result; otherwise use the strongest arc match."""
+def _candidate_rank(row: dict[str, object]) -> tuple[int, float, int]:
+    """Prefer valid, high-confidence geometry across L/N/R candidates."""
     return (
         int(row.get("geometry_valid") is True),
-        int(row.get("shadow_method") == "legacy_boundary_scan"),
+        float(row.get("shadow_quality_score", 0.0)),
         int(row.get("outer_edge_points", 0))
         + int(row.get("inner_edge_points", 0))
         + int(row.get("outer_arc_score", 0)),
@@ -980,6 +936,8 @@ def _date_dirs(data_root: Path, branches: list[str]) -> list[tuple[str, Path]]:
 
 def volume_optical(args: argparse.Namespace) -> None:
     """Run the ported E:/code geometry directly on ADD_with_metadata."""
+    if not 0 < args.min_tank_height_m < args.max_tank_height_m:
+        raise ValueError("expected 0 < min_tank_height_m < max_tank_height_m")
     data_root = Path(args.data_root)
     date_dirs = _date_dirs(data_root, args.branches)
     if not date_dirs:
@@ -1062,9 +1020,12 @@ def volume_optical(args: argparse.Namespace) -> None:
                             shadow = measure_shadow(
                                 read_rgb_u8(shadow_path),
                                 circle,
+                                metadata,
                                 extend_px,
                                 mode,
                                 adjust_px=args.circle_adjust_px,
+                                min_tank_height_m=args.min_tank_height_m,
+                                max_tank_height_m=args.max_tank_height_m,
                             )
                             row.update(
                                 {
@@ -1075,26 +1036,17 @@ def volume_optical(args: argparse.Namespace) -> None:
                                     "inner_edge_points": shadow.inner_edge_points,
                                     "outer_arc_score": shadow.outer_arc_score,
                                     "inner_arc_score": shadow.inner_arc_score,
-                                    "scale_used_m_per_px": metadata.row_gsd_m,
+                                    "shadow_quality_score": shadow.quality_score,
+                                    "shadow_selection_reason": shadow.selection_reason,
+                                    **calculate_volume(
+                                        circle,
+                                        shadow,
+                                        metadata,
+                                        min_tank_height_m=args.min_tank_height_m,
+                                        max_tank_height_m=args.max_tank_height_m,
+                                    ),
                                 }
                             )
-                            if shadow.valid:
-                                row.update(
-                                    volume_from_optical(
-                                        r_m=circle.radius_px * metadata.row_gsd_m,
-                                        lex_m=shadow.lex_px * metadata.row_gsd_m,
-                                        lin_m=shadow.lin_px * metadata.row_gsd_m,
-                                        solar_elev_deg=metadata.solar_elev_deg,
-                                        sat_elev_deg=metadata.sat_elev_deg,
-                                        solar_az_deg=metadata.solar_az_deg,
-                                        sat_az_deg=metadata.sat_az_deg,
-                                    )
-                                )
-                            else:
-                                row.update(
-                                    geometry_valid=False,
-                                    geometry_status=shadow.status,
-                                )
                         except (OSError, ValueError, cv2.error) as exc:
                             row.update(
                                 geometry_valid=False,
@@ -1172,6 +1124,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Legacy circle-mask vertical correction",
     )
+    vo.add_argument("--min-tank-height-m", type=float, default=8.0)
+    vo.add_argument("--max-tank-height-m", type=float, default=25.0)
     vo.add_argument("--limit", type=int, default=None, help="Optional smoke-test limit")
     return p
 
