@@ -18,6 +18,7 @@ import numpy as np
 
 IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 SHADOW_NAME_RE = re.compile(r"^(?P<tank>.+)_(?P<mode>[LNR])$", re.IGNORECASE)
+LEGACY_SHADOW_TOLERANCE_PX = 5.0
 
 
 @dataclass(frozen=True)
@@ -79,18 +80,20 @@ def calculate_volume(
     denominator = optical_height_factor(metadata)
     tank_height_m = lex_m / denominator
     roof_depth_m = lin_m / denominator
-    oil_height_m = tank_height_m - roof_depth_m
+    raw_oil_height_m = tank_height_m - roof_depth_m
+    # The legacy pipeline accepts Lin up to 5 px above Lex and treats that
+    # case as an empty tank (zero oil-column height), not a missing result.
+    oil_height_m = max(0.0, raw_oil_height_m)
     valid = (
         shadow.valid
         and radius_m > 0
         and tank_height_m > 0
-        and 0 <= roof_depth_m <= tank_height_m
+        and roof_depth_m >= 0
     )
+    max_volume_m3 = math.pi * radius_m**2 * tank_height_m if valid else float("nan")
     volume_m3 = math.pi * radius_m**2 * oil_height_m if valid else float("nan")
     if valid:
-        status = "ok"
-    elif shadow.valid and roof_depth_m > tank_height_m:
-        status = "inner_shadow_exceeds_external"
+        status = "oil_empty" if raw_oil_height_m <= 0 else "ok"
     else:
         status = shadow.status
     return {
@@ -101,8 +104,11 @@ def calculate_volume(
         "tank_height_m": tank_height_m,
         "roof_depth_m": roof_depth_m,
         "oil_height_m": oil_height_m,
+        "oil_storage_ratio": oil_height_m / tank_height_m if valid else float("nan"),
+        "max_volume_m3": max_volume_m3,
         "V_m3": volume_m3,
         "V_bbl": volume_m3 / 0.158987 if valid else float("nan"),
+        "V_10k_bbl": volume_m3 / 1589.8 if valid else float("nan"),
         "geometry_valid": valid,
         "geometry_status": status,
         "formula": "optical_shadow_eq1_2",
@@ -206,20 +212,24 @@ def detect_tank_circle(rgb: np.ndarray) -> CircleGeometry:
     if circles is None:
         return CircleGeometry(w / 2, h / 2, 0.0, "failed", 0.0)
 
-    best: tuple[float, float, float] | None = None
+    # The legacy implementation rounds every Hough candidate before both
+    # scoring and returning it. Keeping OpenCV's sub-pixel radius here changes
+    # the mask and propagates into both shadow measurements.
+    rounded_circles = np.round(circles[0]).astype(int)
+    best: tuple[int, int, int] | None = None
     best_support = -1.0
-    for x, y, radius in circles[0]:
+    for x, y, radius in rounded_circles:
         if not 0.3 * h < y < 0.7 * h:
             continue
         mask = np.zeros_like(edges)
-        cv2.circle(mask, (round(float(x)), round(float(y))), round(float(radius)), 255, 1)
+        cv2.circle(mask, (int(x), int(y)), int(radius), 255, 1)
         support = float(np.count_nonzero(cv2.bitwise_and(edges, edges, mask=mask)))
         if support > best_support:
-            best = float(x), float(y), float(radius)
+            best = int(x), int(y), int(radius)
             best_support = support
     if best is None:
         return CircleGeometry(w / 2, h / 2, 0.0, "failed", 0.0)
-    return CircleGeometry(*best, method, best_support)
+    return CircleGeometry(float(best[0]), float(best[1]), float(best[2]), method, best_support)
 
 
 def _split_inner_outer(
@@ -230,7 +240,7 @@ def _split_inner_outer(
     cv2.circle(
         mask,
         (round(circle.cx_px), center_y),
-        round(circle.radius_px * 1.05),
+        int(circle.radius_px * 1.05),
         255,
         -1,
     )
@@ -396,9 +406,17 @@ def _outer_named_points(
         return None
     left, right = upper[0], upper[-1]
     if mode == "L":
-        middle = min(upper, key=lambda p: abs(p[0] - (right[0] - 15)))
+        target_x = right[0] - 15
+        middle = next(
+            (point for point in upper if point[0] == target_x),
+            upper[len(upper) // 2],
+        )
     elif mode == "R":
-        middle = min(upper, key=lambda p: abs(p[0] - (left[0] + 15)))
+        target_x = left[0] + 15
+        middle = next(
+            (point for point in upper if point[0] == target_x),
+            upper[len(upper) // 2],
+        )
     else:
         middle = min(upper, key=lambda p: abs(p[0] - width // 2))
         left = min(upper, key=lambda p: abs(p[0] - (width // 2 - 16)))
@@ -417,7 +435,7 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 def _arc_match(
-    rgb: np.ndarray, circle: CircleGeometry, extend_px: int
+    rgb: np.ndarray, circle: CircleGeometry, extend_px: int, adjust_px: int
 ) -> tuple[float, float, int, int]:
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     filtered = cv2.bilateralFilter(gray, 2, 20, 75)
@@ -426,7 +444,7 @@ def _arc_match(
     edge = cv2.addWeighted(gx, 0.1, gy, 0.9, 0)
     _, edge = cv2.threshold(edge, 50, 255, cv2.THRESH_BINARY)
     cx = round(circle.cx_px)
-    base_y = round(circle.cy_px + extend_px)
+    base_y = round(circle.cy_px + extend_px - adjust_px)
     radius = round(circle.radius_px)
 
     def best_offset(
@@ -481,14 +499,25 @@ def measure_shadow(
                 in_up = min(inner_upper, key=lambda p: abs(p[0] - out_up[0]))
                 in_down = min(inner_lower, key=lambda p: abs(p[0] - out_up[0]))
                 lin = _distance(in_up, in_down)
-        valid = out_up[0] != 0 and out_up[1] > -5 and lex > 0 and 0 <= lin <= lex
+        valid = (
+            out_up[0] != 0
+            and out_up[1] > -5
+            and lex > 0
+            and lin >= 0
+            and lex - lin >= -LEGACY_SHADOW_TOLERANCE_PX
+        )
     if valid:
         return ShadowGeometry(
             lex, lin, "legacy_boundary_scan", True, "ok", len(out_upper), len(inner_upper)
         )
 
-    lex, lin, out_score, in_score = _arc_match(rgb, circle, extend_px)
-    valid = out_score > 0 and lex > 0 and 0 <= lin <= lex
+    lex, lin, out_score, in_score = _arc_match(rgb, circle, extend_px, adjust_px)
+    valid = (
+        out_score > 0
+        and lex > 0
+        and lin >= 0
+        and lex - lin >= -LEGACY_SHADOW_TOLERANCE_PX
+    )
     return ShadowGeometry(
         lex,
         lin,

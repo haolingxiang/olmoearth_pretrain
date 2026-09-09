@@ -63,6 +63,17 @@ class OpticalTankPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(result["roof_depth_m"], 4.0, places=5)
         self.assertAlmostEqual(result["V_m3"], math.pi * 100 * 8, places=4)
 
+    def test_small_inner_shadow_excess_is_reported_as_empty_tank(self) -> None:
+        metadata = OpticalMetadata(45, 0, 90, 0, 1.0, 1.0)
+        circle = CircleGeometry(50, 50, 10, "test", 1)
+        shadow = ShadowGeometry(12, 14, "test", True, "ok", 1, 1)
+        result = calculate_volume(circle, shadow, metadata)
+        self.assertTrue(result["geometry_valid"])
+        self.assertEqual(result["geometry_status"], "oil_empty")
+        self.assertEqual(result["oil_storage_ratio"], 0.0)
+        self.assertEqual(result["V_m3"], 0.0)
+        self.assertAlmostEqual(result["max_volume_m3"], math.pi * 100 * 12, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()
