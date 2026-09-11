@@ -860,9 +860,8 @@ def train(args: argparse.Namespace) -> None:
         totals: Counter[str] = Counter()
         batches = 0
         started = time.time()
-        for step, (images, targets) in enumerate(
-            tqdm(loader, desc=f"epoch {epoch}/{args.epochs}"), start=1
-        ):
+        progress = tqdm(loader, desc=f"epoch {epoch}/{args.epochs}")
+        for step, (images, targets) in enumerate(progress, start=1):
             images = [image.to(device, non_blocking=True) for image in images]
             targets = [
                 {key: value.to(device, non_blocking=True) for key, value in target.items()}
@@ -886,6 +885,17 @@ def train(args: argparse.Namespace) -> None:
                 totals[name] += float(value.detach())
             totals["loss"] += float(sum(loss_dict.values()).detach())
             batches += 1
+            if step % args.log_every == 0 or step == len(loader):
+                postfix = {
+                    "loss": f"{totals['loss'] / batches:.4f}",
+                    "cls": f"{totals['loss_classifier'] / batches:.4f}",
+                    "box": f"{totals['loss_box_reg'] / batches:.4f}",
+                    "mask": f"{totals['loss_mask'] / batches:.4f}",
+                    "obj": f"{totals['loss_objectness'] / batches:.4f}",
+                    "rpn_box": f"{totals['loss_rpn_box_reg'] / batches:.4f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                }
+                progress.set_postfix(postfix, refresh=True)
         scheduler.step()
         row: dict[str, Any] = {
             "epoch": epoch,
@@ -905,10 +915,22 @@ def train(args: argparse.Namespace) -> None:
             row.update({f"val_{key}": value for key, value in metrics.items()})
             print(
                 f"epoch={epoch} loss={row['loss']:.4f} "
+                f"cls={row['loss_classifier']:.4f} "
+                f"box={row['loss_box_reg']:.4f} "
+                f"mask={row['loss_mask']:.4f} "
+                f"obj={row['loss_objectness']:.4f} "
+                f"rpn_box={row['loss_rpn_box_reg']:.4f} "
                 f"val_AP={metrics['AP']:.4f} val_AP50={metrics['AP50']:.4f}"
             )
         else:
-            print(f"epoch={epoch} loss={row['loss']:.4f}")
+            print(
+                f"epoch={epoch} loss={row['loss']:.4f} "
+                f"cls={row['loss_classifier']:.4f} "
+                f"box={row['loss_box_reg']:.4f} "
+                f"mask={row['loss_mask']:.4f} "
+                f"obj={row['loss_objectness']:.4f} "
+                f"rpn_box={row['loss_rpn_box_reg']:.4f}"
+            )
         history.append(row)
         save_checkpoint(out_dir / "last.pt", model, optimizer, scheduler, epoch, args, metrics)
         if metrics is not None and metrics["AP50"] > best_ap50:
@@ -1023,6 +1045,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--lr", type=float, default=2e-4)
     train_parser.add_argument("--weight-decay", type=float, default=1e-4)
     train_parser.add_argument("--clip-grad-norm", type=float, default=5.0)
+    train_parser.add_argument(
+        "--log-every",
+        type=int,
+        default=500,
+        help="update training loss display every N batches (default: 500)",
+    )
     train_parser.add_argument("--eval-every", type=int, default=4)
     train_parser.add_argument(
         "--val-max-images",
@@ -1070,6 +1098,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("image limits must be non-negative")
         if args.eval_every < 1:
             raise ValueError("--eval-every must be positive")
+        if args.log_every < 1:
+            raise ValueError("--log-every must be positive")
 
 
 def main() -> None:
