@@ -328,12 +328,15 @@ class OlmoEarthPyramid(nn.Module):
         embedding_size: int,
     ) -> None:
         super().__init__()
-        self.olmo = olmo
+        # Instance segmentation only needs the pretrained encoder. Keeping the
+        # pretraining decoder would waste roughly another 140M frozen parameters
+        # and substantial GPU memory.
+        self.encoder = olmo.encoder
         self.task = task
         self.patch_size = patch_size
-        for parameter in self.olmo.parameters():
+        for parameter in self.encoder.parameters():
             parameter.requires_grad = False
-        self.olmo.eval()
+        self.encoder.eval()
 
         s2_low, s2_high = _normalization_bounds(Modality.SENTINEL2_L2A)
         s1_low, s1_high = _normalization_bounds(Modality.SENTINEL1)
@@ -363,7 +366,7 @@ class OlmoEarthPyramid(nn.Module):
 
     def train(self, mode: bool = True) -> "OlmoEarthPyramid":
         super().train(mode)
-        self.olmo.eval()
+        self.encoder.eval()
         return self
 
     def _sample(self, images: torch.Tensor) -> MaskedOlmoEarthSample:
@@ -412,7 +415,7 @@ class OlmoEarthPyramid(nn.Module):
         if images.shape[-1] % self.patch_size or images.shape[-2] % self.patch_size:
             raise ValueError("tile dimensions must be divisible by --patch-size")
         with torch.no_grad():
-            encoded = self.olmo.encoder(
+            encoded = self.encoder(
                 self._sample(images), fast_pass=True, patch_size=self.patch_size
             )["tokens_and_masks"]
             s2 = encoded.sentinel2_l2a.mean(dim=(3, 4)).permute(0, 3, 1, 2)
@@ -436,7 +439,10 @@ def build_model(
     device: torch.device,
 ) -> MaskRCNN:
     print(f"loading frozen OlmoEarth backbone from {weights}")
-    olmo = load_model_from_path(weights).to(device)
+    # Load on CPU and retain only the online encoder before moving the downstream
+    # model to CUDA. This avoids a transient GPU allocation for the unused
+    # pretraining target/decoder branches.
+    olmo = load_model_from_path(weights)
     config = json.loads((weights / "config.json").read_text(encoding="utf-8"))
     embedding_size = int(config["model"]["encoder_config"]["embedding_size"])
     backbone = OlmoEarthPyramid(olmo, task, patch_size, embedding_size)
@@ -469,7 +475,7 @@ def trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {
         key: value.detach().cpu()
         for key, value in model.state_dict().items()
-        if not key.startswith("backbone.olmo.")
+        if not key.startswith("backbone.encoder.")
     }
 
 
@@ -483,8 +489,14 @@ def load_trainable_state(model: nn.Module, checkpoint: dict[str, Any]) -> None:
     }
     skipped = sorted(set(source) - set(compatible))
     result = model.load_state_dict(compatible, strict=False)
-    unexpected = [key for key in result.unexpected_keys if not key.startswith("backbone.olmo.")]
-    missing = [key for key in result.missing_keys if not key.startswith("backbone.olmo.")]
+    unexpected = [
+        key
+        for key in result.unexpected_keys
+        if not key.startswith("backbone.encoder.")
+    ]
+    missing = [
+        key for key in result.missing_keys if not key.startswith("backbone.encoder.")
+    ]
     print(
         f"loaded {len(compatible)} trainable tensors; "
         f"shape/missing skipped={len(skipped)}, target-only={len(missing)}"
