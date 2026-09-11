@@ -513,6 +513,7 @@ def save_checkpoint(
     epoch: int,
     args: argparse.Namespace,
     metrics: dict[str, float] | None,
+    best_ap50: float | None = None,
 ) -> None:
     torch.save(
         {
@@ -524,6 +525,7 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "metrics": metrics,
+            "best_ap50": best_ap50,
             "args": vars(args),
         },
         path,
@@ -753,6 +755,9 @@ def evaluate_coco(
     if not predictions:
         return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0}
     coco_gt = COCO(str(ground_truth_path))
+    # Some valid COCO-style datasets (including UBC v2.0) omit the optional
+    # top-level ``info`` field. pycocotools.loadRes() accesses it unconditionally.
+    coco_gt.dataset.setdefault("info", {})
     coco_dt = coco_gt.loadRes(predictions)
     evaluator = COCOeval(coco_gt, coco_dt, "segm")
     if image_ids is not None:
@@ -839,7 +844,9 @@ def train(args: argparse.Namespace) -> None:
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = int(checkpoint["epoch"]) + 1
-        if checkpoint.get("metrics"):
+        if checkpoint.get("best_ap50") is not None:
+            best_ap50 = float(checkpoint["best_ap50"])
+        elif checkpoint.get("metrics"):
             best_ap50 = float(checkpoint["metrics"].get("AP50", -1.0))
     trainable = sum(parameter.numel() for parameter in parameters)
     frozen = sum(
@@ -852,7 +859,16 @@ def train(args: argparse.Namespace) -> None:
         f"val_images={len(val_index.images)} tiles/epoch={len(dataset)}"
     )
     print(f"parameters: trainable={trainable:,}, frozen={frozen:,}")
+    history_path = out_dir / "history.json"
     history: list[dict[str, Any]] = []
+    if args.resume and history_path.exists():
+        loaded_history = json.loads(history_path.read_text(encoding="utf-8"))
+        if isinstance(loaded_history, list):
+            history = [
+                row
+                for row in loaded_history
+                if isinstance(row, dict) and int(row.get("epoch", 0)) < start_epoch
+            ]
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
@@ -906,6 +922,18 @@ def train(args: argparse.Namespace) -> None:
         metrics: dict[str, float] | None = None
         should_eval = epoch % args.eval_every == 0 or epoch == args.epochs
         if should_eval:
+            # Preserve the completed training epoch before potentially lengthy
+            # sliding-window inference and COCO evaluation.
+            save_checkpoint(
+                out_dir / "last.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                args,
+                metrics=None,
+                best_ap50=best_ap50,
+            )
             predictions, image_ids = predict_split(
                 model, val_index, args, device, max_images=args.val_max_images
             )
@@ -932,12 +960,30 @@ def train(args: argparse.Namespace) -> None:
                 f"rpn_box={row['loss_rpn_box_reg']:.4f}"
             )
         history.append(row)
-        save_checkpoint(out_dir / "last.pt", model, optimizer, scheduler, epoch, args, metrics)
         if metrics is not None and metrics["AP50"] > best_ap50:
             best_ap50 = metrics["AP50"]
-            save_checkpoint(out_dir / "best.pt", model, optimizer, scheduler, epoch, args, metrics)
+            save_checkpoint(
+                out_dir / "best.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                args,
+                metrics,
+                best_ap50,
+            )
             print(f"saved best.pt (AP50={best_ap50:.4f})")
-        (out_dir / "history.json").write_text(
+        save_checkpoint(
+            out_dir / "last.pt",
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            args,
+            metrics,
+            best_ap50,
+        )
+        history_path.write_text(
             json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     print(f"training complete: {out_dir}")
@@ -975,6 +1021,22 @@ def evaluate_command(args: argparse.Namespace) -> None:
     )
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     print(f"predictions: {out_json}")
+    print(f"metrics: {metrics_path}")
+
+
+def evaluate_json_command(args: argparse.Namespace) -> None:
+    paths = resolve_split_paths(Path(args.data_root), args.task, args.split)
+    index = CocoIndex(paths)
+    rows = select_eval_images(index.images, args.max_images, args.seed)
+    image_ids = [int(row["id"]) for row in rows]
+    prediction_path = Path(args.predictions_json)
+    predictions = json.loads(prediction_path.read_text(encoding="utf-8"))
+    metrics = evaluate_coco(paths.json_path, predictions, image_ids)
+    metrics_path = prediction_path.with_suffix(".metrics.json")
+    metrics_path.write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
     print(f"metrics: {metrics_path}")
 
 
@@ -1056,7 +1118,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--val-max-images",
         type=int,
         default=0,
-        help="0 evaluates the full val split (default); positive values are smoke tests only",
+        help=(
+            "0 evaluates the full val split; a positive value evaluates a "
+            "fixed seed-random subset"
+        ),
     )
     train_parser.add_argument("--resume", default=None)
     train_parser.add_argument(
@@ -1073,11 +1138,25 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--split", choices=("train", "val", "test"), default="test")
         sub.add_argument("--out-json", required=True)
         sub.add_argument("--max-images", type=int, default=0, help="0 processes all images")
+
+    eval_json_parser = commands.add_parser(
+        "eval-json", help="evaluate an existing COCO prediction JSON without inference"
+    )
+    eval_json_parser.add_argument("--data-root", required=True, help="UBC_v2.0 directory")
+    eval_json_parser.add_argument("--task", choices=("single", "multimodal"), required=True)
+    eval_json_parser.add_argument(
+        "--split", choices=("train", "val", "test"), default="val"
+    )
+    eval_json_parser.add_argument("--predictions-json", required=True)
+    eval_json_parser.add_argument("--max-images", type=int, default=0)
+    eval_json_parser.add_argument("--seed", type=int, default=42)
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.tile_size <= 0 or args.tile_size % args.patch_size:
+    if hasattr(args, "tile_size") and (
+        args.tile_size <= 0 or args.tile_size % args.patch_size
+    ):
         raise ValueError("--tile-size must be positive and divisible by --patch-size")
     if hasattr(args, "stride") and not 0 < args.stride <= args.tile_size:
         raise ValueError("expected 0 < --stride <= --tile-size")
@@ -1100,6 +1179,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--eval-every must be positive")
         if args.log_every < 1:
             raise ValueError("--log-every must be positive")
+    elif args.command == "eval-json" and args.max_images < 0:
+        raise ValueError("--max-images must be non-negative")
 
 
 def main() -> None:
@@ -1109,6 +1190,8 @@ def main() -> None:
         train(args)
     elif args.command == "eval":
         evaluate_command(args)
+    elif args.command == "eval-json":
+        evaluate_json_command(args)
     else:
         predict_command(args)
 
