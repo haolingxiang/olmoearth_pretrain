@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.anchor_utils import AnchorGenerator
-from torchvision.ops import MultiScaleRoIAlign
+from torchvision.ops import MultiScaleRoIAlign, batched_nms
 from tqdm import tqdm
 
 from olmoearth_pretrain.data.constants import Modality
@@ -176,7 +176,7 @@ def _boxes_from_masks(masks: torch.Tensor) -> torch.Tensor:
 
 
 class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
-    """Object-aware random 128-pixel crops for Mask R-CNN training."""
+    """Per-image and globally class-balanced object-aware training crops."""
 
     def __init__(
         self,
@@ -186,6 +186,7 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         object_crop_probability: float,
         min_visible_fraction: float,
         min_mask_area: int,
+        balanced_extra_samples: int,
         augment: bool,
         max_images: int | None = None,
     ) -> None:
@@ -200,6 +201,7 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         self.object_crop_probability = object_crop_probability
         self.min_visible_fraction = min_visible_fraction
         self.min_mask_area = min_mask_area
+        self.balanced_extra_samples = balanced_extra_samples
         self.augment = augment
         counts = Counter(
             int(ann["category_id"])
@@ -207,31 +209,88 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
             for ann in anns
         )
         self.class_weights = {key: 1.0 / math.sqrt(value) for key, value in counts.items()}
+        allowed_image_ids = {int(row["id"]) for row in self.images}
+        annotations_by_category: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for image_id in allowed_image_ids:
+            for annotation in index.annotations_by_image[image_id]:
+                annotations_by_category[int(annotation["category_id"])].append(annotation)
+        self.annotations_by_category = {
+            category_id: annotations
+            for category_id, annotations in annotations_by_category.items()
+            if annotations
+        }
+        self.balanced_categories = sorted(self.annotations_by_category)
+        # Sampling categories proportional to sqrt(count) is equivalent to
+        # weighting every annotation by 1/sqrt(count). It strongly reduces the
+        # natural imbalance without repeating the rarest class uniformly and
+        # excessively on every epoch.
+        self.balanced_category_weights = [
+            math.sqrt(len(self.annotations_by_category[category_id]))
+            for category_id in self.balanced_categories
+        ]
 
     def __len__(self) -> int:
-        return len(self.images) * self.samples_per_image
+        return len(self.images) * (
+            self.samples_per_image + self.balanced_extra_samples
+        )
 
-    def _crop_origin(self, row: dict[str, Any]) -> tuple[int, int]:
+    def _origin_for_annotation(
+        self, row: dict[str, Any], annotation: dict[str, Any]
+    ) -> tuple[int, int]:
         width, height = int(row["width"]), int(row["height"])
         max_x, max_y = max(0, width - self.tile_size), max(0, height - self.tile_size)
-        anns = self.index.annotations_by_image[int(row["id"])]
-        if anns and random.random() < self.object_crop_probability:
-            weights = [self.class_weights[int(ann["category_id"])] for ann in anns]
-            ann = random.choices(anns, weights=weights, k=1)[0]
-            x, y, w, h = (float(value) for value in ann["bbox"])
-            jitter = self.tile_size * 0.2
-            cx = x + w / 2 + random.uniform(-jitter, jitter)
-            cy = y + h / 2 + random.uniform(-jitter, jitter)
-            x0 = round(cx - self.tile_size / 2)
-            y0 = round(cy - self.tile_size / 2)
-            return min(max(x0, 0), max_x), min(max(y0, 0), max_y)
+        x, y, w, h = (float(value) for value in annotation["bbox"])
+
+        def choose_axis(start: float, extent: float, maximum: int) -> int:
+            if extent <= self.tile_size:
+                # Choose a crop that fully contains the selected instance whenever
+                # possible. Random placement within this interval retains context
+                # diversity without teaching an avoidably truncated target.
+                low = max(0, math.ceil(start + extent - self.tile_size))
+                high = min(maximum, math.floor(start))
+                if low <= high:
+                    return random.randint(low, high)
+            center = start + extent / 2
+            return min(max(round(center - self.tile_size / 2), 0), maximum)
+
+        return choose_axis(x, w, max_x), choose_axis(y, h, max_y)
+
+    def _crop_origin(
+        self, row: dict[str, Any], target_annotation: dict[str, Any] | None = None
+    ) -> tuple[int, int]:
+        width, height = int(row["width"]), int(row["height"])
+        max_x, max_y = max(0, width - self.tile_size), max(0, height - self.tile_size)
+        if target_annotation is not None:
+            return self._origin_for_annotation(row, target_annotation)
         return random.randint(0, max_x), random.randint(0, max_y)
 
     def __getitem__(self, item: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        sample_slot = item // len(self.images)
         row = self.images[item % len(self.images)]
+        target_annotation: dict[str, Any] | None = None
+        if (
+            self.balanced_extra_samples > 0
+            and sample_slot >= self.samples_per_image
+            and self.balanced_categories
+        ):
+            category_id = random.choices(
+                self.balanced_categories,
+                weights=self.balanced_category_weights,
+                k=1,
+            )[0]
+            target_annotation = random.choice(self.annotations_by_category[category_id])
+            row = self.index.image_by_id[int(target_annotation["image_id"])]
+        elif random.random() < self.object_crop_probability:
+            annotations = self.index.annotations_by_image[int(row["id"])]
+            if annotations:
+                weights = [
+                    self.class_weights[int(annotation["category_id"])]
+                    for annotation in annotations
+                ]
+                target_annotation = random.choices(annotations, weights=weights, k=1)[0]
         image = self.index.load_image(row)
         height, width = image.shape[:2]
-        x0, y0 = self._crop_origin(row)
+        x0, y0 = self._crop_origin(row, target_annotation)
         x1, y1 = min(width, x0 + self.tile_size), min(height, y0 + self.tile_size)
         crop = image[y0:y1, x0:x1]
         if crop.shape[:2] != (self.tile_size, self.tile_size):
@@ -262,7 +321,11 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
             full_area = max(float(ann.get("area", full_mask.sum())), 1.0)
             if local_area < self.min_mask_area:
                 continue
-            if local_area / full_area < self.min_visible_fraction:
+            is_focus_target = (
+                target_annotation is not None
+                and int(ann["id"]) == int(target_annotation["id"])
+            )
+            if local_area / full_area < self.min_visible_fraction and not is_focus_target:
                 continue
             masks.append(local)
             labels.append(int(ann["category_id"]))
@@ -462,10 +525,10 @@ def build_model(
         box_roi_pool=MultiScaleRoIAlign(feature_names, output_size=7, sampling_ratio=2),
         mask_roi_pool=MultiScaleRoIAlign(feature_names, output_size=14, sampling_ratio=2),
         rpn_pre_nms_top_n_train=4000,
-        rpn_pre_nms_top_n_test=2000,
+        rpn_pre_nms_top_n_test=1000,
         rpn_post_nms_top_n_train=2000,
-        rpn_post_nms_top_n_test=1000,
-        box_detections_per_img=500,
+        rpn_post_nms_top_n_test=400,
+        box_detections_per_img=150,
         box_score_thresh=0.03,
     )
     return model.to(device)
@@ -538,6 +601,24 @@ class Candidate:
     score: float
     mask: np.ndarray
     bbox: tuple[float, float, float, float]
+    source_tiles: frozenset[int]
+    touches_tile_boundary: bool
+
+
+@dataclass
+class RawCandidate:
+    """Tile-local candidate retained without allocating a full-image mask."""
+
+    label: int
+    score: float
+    local_mask: np.ndarray
+    bbox: tuple[float, float, float, float]
+    x0: int
+    y0: int
+    valid_h: int
+    valid_w: int
+    tile_id: int
+    touches_tile_boundary: bool
 
 
 def sliding_origins(length: int, tile_size: int, stride: int) -> list[int]:
@@ -577,17 +658,67 @@ def _mask_containment(a: np.ndarray, b: np.ndarray) -> float:
     return intersection / max(min(int(a.sum()), int(b.sum())), 1)
 
 
+def fast_box_nms(
+    candidates: list[RawCandidate], iou_threshold: float, max_candidates: int
+) -> list[RawCandidate]:
+    """Cheap class-aware box NMS before full-resolution mask materialization."""
+    if not candidates:
+        return []
+    boxes = torch.tensor([row.bbox for row in candidates], dtype=torch.float32)
+    scores = torch.tensor([row.score for row in candidates], dtype=torch.float32)
+    labels = torch.tensor([row.label for row in candidates], dtype=torch.int64)
+    keep = batched_nms(boxes, scores, labels, iou_threshold).tolist()
+    if max_candidates > 0:
+        keep = keep[:max_candidates]
+    return [candidates[index] for index in keep]
+
+
+def materialize_candidate(candidate: RawCandidate, height: int, width: int) -> Candidate:
+    full = np.zeros((height, width), dtype=bool)
+    full[
+        candidate.y0 : candidate.y0 + candidate.valid_h,
+        candidate.x0 : candidate.x0 + candidate.valid_w,
+    ] = candidate.local_mask
+    return Candidate(
+        label=candidate.label,
+        score=candidate.score,
+        mask=full,
+        bbox=candidate.bbox,
+        source_tiles=frozenset((candidate.tile_id,)),
+        touches_tile_boundary=candidate.touches_tile_boundary,
+    )
+
+
+def merge_candidates(a: Candidate, b: Candidate) -> Candidate:
+    """Union two same-instance fragments produced by overlapping tiles."""
+    return Candidate(
+        label=a.label,
+        score=max(a.score, b.score),
+        mask=np.logical_or(a.mask, b.mask),
+        bbox=(
+            min(a.bbox[0], b.bbox[0]),
+            min(a.bbox[1], b.bbox[1]),
+            max(a.bbox[2], b.bbox[2]),
+            max(a.bbox[3], b.bbox[3]),
+        ),
+        source_tiles=a.source_tiles | b.source_tiles,
+        touches_tile_boundary=a.touches_tile_boundary or b.touches_tile_boundary,
+    )
+
+
 def mask_nms(
     candidates: list[Candidate],
     same_class_threshold: float,
     cross_class_threshold: float,
     containment_threshold: float,
+    merge_iou_threshold: float,
+    merge_containment_threshold: float,
     max_instances: int,
 ) -> list[Candidate]:
     kept: list[Candidate] = []
     for candidate in sorted(candidates, key=lambda row: row.score, reverse=True):
         duplicate = False
-        for previous in kept:
+        for index, previous in enumerate(kept):
             threshold = (
                 same_class_threshold
                 if candidate.label == previous.label
@@ -595,10 +726,27 @@ def mask_nms(
             )
             if _bbox_iou(candidate.bbox, previous.bbox) < 0.05:
                 continue
+            mask_iou = _mask_iou(candidate.mask, previous.mask)
+            containment = _mask_containment(candidate.mask, previous.mask)
+            same_class = candidate.label == previous.label
+            cross_window = candidate.source_tiles.isdisjoint(previous.source_tiles)
+            boundary_fragment = (
+                candidate.touches_tile_boundary or previous.touches_tile_boundary
+            )
             if (
-                _mask_iou(candidate.mask, previous.mask) >= threshold
-                or _mask_containment(candidate.mask, previous.mask)
-                >= containment_threshold
+                same_class
+                and cross_window
+                and boundary_fragment
+                and (
+                    mask_iou >= merge_iou_threshold
+                    or containment >= merge_containment_threshold
+                )
+            ):
+                kept[index] = merge_candidates(previous, candidate)
+                duplicate = True
+                break
+            if (
+                mask_iou >= threshold or containment >= containment_threshold
             ):
                 duplicate = True
                 break
@@ -627,9 +775,14 @@ def predict_image(
     tile_batch_size: int,
     score_threshold: float,
     mask_threshold: float,
+    box_nms: float,
+    pre_mask_nms_topk: int,
     same_class_nms: float,
     cross_class_nms: float,
     containment_nms: float,
+    mask_merge_iou: float,
+    mask_merge_containment: float,
+    tile_border_margin: int,
     max_instances: int,
     amp: bool,
 ) -> list[Candidate]:
@@ -639,7 +792,7 @@ def predict_image(
         for y0 in sliding_origins(height, tile_size, stride)
         for x0 in sliding_origins(width, tile_size, stride)
     ]
-    candidates: list[Candidate] = []
+    raw_candidates: list[RawCandidate] = []
     for start in range(0, len(jobs), tile_batch_size):
         batch_jobs = jobs[start : start + tile_batch_size]
         tiles = [_tile_tensor(image, x, y, tile_size).to(device) for x, y in batch_jobs]
@@ -649,7 +802,10 @@ def predict_image(
             enabled=amp and device.type == "cuda",
         ):
             outputs = model(tiles)
-        for (x0, y0), output in zip(batch_jobs, outputs, strict=True):
+        for job_offset, ((x0, y0), output) in enumerate(
+            zip(batch_jobs, outputs, strict=True)
+        ):
+            tile_id = start + job_offset
             scores = output["scores"].detach().float().cpu().numpy()
             labels = output["labels"].detach().cpu().numpy()
             boxes = output["boxes"].detach().float().cpu().numpy()
@@ -664,20 +820,60 @@ def predict_image(
                 local = local[:valid_h, :valid_w]
                 if not local.any():
                     continue
-                full = np.zeros((height, width), dtype=bool)
-                full[y0 : y0 + valid_h, x0 : x0 + valid_w] = local
                 bx1 = min(max(float(box[0]) + x0, 0.0), float(width))
                 by1 = min(max(float(box[1]) + y0, 0.0), float(height))
                 bx2 = min(max(float(box[2]) + x0, 0.0), float(width))
                 by2 = min(max(float(box[3]) + y0, 0.0), float(height))
-                candidates.append(
-                    Candidate(int(label), float(score), full, (bx1, by1, bx2, by2))
+                margin = min(tile_border_margin, valid_h, valid_w)
+                touches_boundary = margin > 0 and (
+                    (
+                        y0 > 0
+                        and (local[:margin, :].any() or float(box[1]) <= margin)
+                    )
+                    or (
+                        y0 + valid_h < height
+                        and (
+                            local[-margin:, :].any()
+                            or float(box[3]) >= valid_h - margin
+                        )
+                    )
+                    or (
+                        x0 > 0
+                        and (local[:, :margin].any() or float(box[0]) <= margin)
+                    )
+                    or (
+                        x0 + valid_w < width
+                        and (
+                            local[:, -margin:].any()
+                            or float(box[2]) >= valid_w - margin
+                        )
+                    )
                 )
+                raw_candidates.append(
+                    RawCandidate(
+                        int(label),
+                        float(score),
+                        local,
+                        (bx1, by1, bx2, by2),
+                        x0,
+                        y0,
+                        valid_h,
+                        valid_w,
+                        tile_id,
+                        bool(touches_boundary),
+                    )
+                )
+    raw_candidates = fast_box_nms(raw_candidates, box_nms, pre_mask_nms_topk)
+    candidates = [
+        materialize_candidate(candidate, height, width) for candidate in raw_candidates
+    ]
     return mask_nms(
         candidates,
         same_class_nms,
         cross_class_nms,
         containment_nms,
+        mask_merge_iou,
+        mask_merge_containment,
         max_instances,
     )
 
@@ -732,9 +928,14 @@ def predict_split(
             args.tile_batch_size,
             args.score_threshold,
             args.mask_threshold,
+            args.box_nms,
+            args.pre_mask_nms_topk,
             args.same_class_nms,
             args.cross_class_nms,
             args.containment_nms,
+            args.mask_merge_iou,
+            args.mask_merge_containment,
+            args.tile_border_margin,
             args.max_instances,
             args.amp,
         )
@@ -813,6 +1014,7 @@ def train(args: argparse.Namespace) -> None:
         args.object_crop_probability,
         args.min_visible_fraction,
         args.min_mask_area,
+        args.balanced_extra_samples,
         augment=True,
         max_images=args.max_train_images,
     )
@@ -857,6 +1059,10 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"task={args.task} device={device} train_images={len(dataset.images)} "
         f"val_images={len(val_index.images)} tiles/epoch={len(dataset)}"
+    )
+    print(
+        f"crop sampling: per-image slots={args.samples_per_image}, "
+        f"additional global class-balanced slots={dataset.balanced_extra_samples}"
     )
     print(f"parameters: trainable={trainable:,}, frozen={frozen:,}")
     history_path = out_dir / "history.json"
@@ -1057,7 +1263,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-root", required=True, help="UBC_v2.0 directory")
     parser.add_argument("--weights", required=True, help="OlmoEarth checkpoint directory")
     parser.add_argument("--task", choices=("single", "multimodal"), required=True)
-    parser.add_argument("--tile-size", type=int, default=128)
+    parser.add_argument("--tile-size", type=int, default=256)
     parser.add_argument("--patch-size", type=int, default=4, choices=range(1, 9))
     parser.add_argument("--device", default=None, help="Default: cuda when available")
     parser.add_argument("--seed", type=int, default=42)
@@ -1067,10 +1273,22 @@ def add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def add_inference(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--stride", type=int, default=96)
+    parser.add_argument("--stride", type=int, default=128)
     parser.add_argument("--tile-batch-size", type=int, default=4)
     parser.add_argument("--score-threshold", type=float, default=0.05)
     parser.add_argument("--mask-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--box-nms",
+        type=float,
+        default=0.8,
+        help="class-aware box NMS before expensive full-image mask processing",
+    )
+    parser.add_argument(
+        "--pre-mask-nms-topk",
+        type=int,
+        default=1000,
+        help="maximum candidates entering full-image mask NMS and fusion",
+    )
     parser.add_argument("--same-class-nms", type=float, default=0.5)
     parser.add_argument("--cross-class-nms", type=float, default=0.7)
     parser.add_argument(
@@ -1078,6 +1296,24 @@ def add_inference(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.85,
         help="suppress a clipped mask when it is mostly contained in another",
+    )
+    parser.add_argument(
+        "--mask-merge-iou",
+        type=float,
+        default=0.2,
+        help="union same-class cross-tile boundary masks above this IoU",
+    )
+    parser.add_argument(
+        "--mask-merge-containment",
+        type=float,
+        default=0.5,
+        help="union boundary masks when intersection/smaller-mask exceeds this value",
+    )
+    parser.add_argument(
+        "--tile-border-margin",
+        type=int,
+        default=3,
+        help="pixels used to identify masks clipped by an internal tile boundary",
     )
     parser.add_argument("--max-instances", type=int, default=500)
 
@@ -1094,7 +1330,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--batch-size", type=int, default=4)
     train_parser.add_argument("--accum-steps", type=int, default=2)
     train_parser.add_argument("--workers", type=int, default=4)
-    train_parser.add_argument("--samples-per-image", type=int, default=2)
+    train_parser.add_argument("--samples-per-image", type=int, default=4)
     train_parser.add_argument(
         "--max-train-images",
         type=int,
@@ -1102,7 +1338,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="0 uses all images; set a small number only for smoke tests",
     )
     train_parser.add_argument("--object-crop-probability", type=float, default=0.85)
-    train_parser.add_argument("--min-visible-fraction", type=float, default=0.25)
+    train_parser.add_argument(
+        "--balanced-extra-samples",
+        type=int,
+        default=1,
+        help=(
+            "additional sqrt-balanced global crops per training-image equivalent; "
+            "these do not replace --samples-per-image crops"
+        ),
+    )
+    train_parser.add_argument("--min-visible-fraction", type=float, default=0.5)
     train_parser.add_argument("--min-mask-area", type=int, default=4)
     train_parser.add_argument("--lr", type=float, default=2e-4)
     train_parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -1163,9 +1408,13 @@ def validate_args(args: argparse.Namespace) -> None:
     probability_names = (
         "score_threshold",
         "mask_threshold",
+        "box_nms",
         "same_class_nms",
         "cross_class_nms",
         "containment_nms",
+        "mask_merge_iou",
+        "mask_merge_containment",
+        "object_crop_probability",
     )
     for name in probability_names:
         if hasattr(args, name) and not 0 <= getattr(args, name) <= 1:
@@ -1175,11 +1424,17 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("batch, accumulation, and sampling counts must be positive")
         if args.max_train_images < 0 or args.val_max_images < 0:
             raise ValueError("image limits must be non-negative")
+        if args.balanced_extra_samples < 0:
+            raise ValueError("--balanced-extra-samples must be non-negative")
         if args.eval_every < 1:
             raise ValueError("--eval-every must be positive")
         if args.log_every < 1:
             raise ValueError("--log-every must be positive")
-    elif args.command == "eval-json" and args.max_images < 0:
+    if hasattr(args, "pre_mask_nms_topk") and args.pre_mask_nms_topk < 1:
+        raise ValueError("--pre-mask-nms-topk must be positive")
+    if hasattr(args, "tile_border_margin") and args.tile_border_margin < 1:
+        raise ValueError("--tile-border-margin must be positive")
+    if args.command == "eval-json" and args.max_images < 0:
         raise ValueError("--max-images must be non-negative")
 
 

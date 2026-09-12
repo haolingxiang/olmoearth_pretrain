@@ -82,7 +82,10 @@ python scripts/tools/train_ubc_roof_instance.py train \
   --epochs 1 \
   --max-train-images 8 \
   --val-max-images 2 \
-  --samples-per-image 1 \
+  --samples-per-image 4 \
+  --balanced-extra-samples 1 \
+  --tile-size 256 \
+  --stride 128 \
   --batch-size 1 \
   --accum-steps 1 \
   --tile-batch-size 1 \
@@ -105,15 +108,16 @@ python scripts/tools/train_ubc_roof_instance.py train \
   --data-root /root/autodl-tmp/UBC_v2.0 \
   --weights /root/autodl-tmp/olmoearth_pretrain/weights/OlmoEarth-v1_2-Base \
   --task single \
-  --out-dir runs/ubc_single \
+  --out-dir runs/ubc_single_256 \
   --epochs 24 \
-  --batch-size 4 \
+  --batch-size 2 \
   --accum-steps 2 \
   --workers 4 \
-  --samples-per-image 2 \
-  --tile-size 128 \
+  --samples-per-image 4 \
+  --balanced-extra-samples 1 \
+  --tile-size 256 \
   --patch-size 4 \
-  --stride 96 \
+  --stride 128 \
   --tile-batch-size 4 \
   --eval-every 4 \
   --val-max-images 0 \
@@ -128,7 +132,7 @@ python scripts/tools/train_ubc_roof_instance.py train \
 --eval-every 1 --val-max-images 0
 ```
 
-完整验证耗时较长。单模态验证集共有 2507 张影像，每次完整验证约处理 62675 个滑窗。
+完整验证耗时较长。单模态验证集共有 2507 张影像，每次完整验证处理 22563 个滑窗。
 
 ## 5. 单模态完整验证
 
@@ -137,20 +141,20 @@ python scripts/tools/train_ubc_roof_instance.py eval \
   --data-root /root/autodl-tmp/UBC_v2.0 \
   --weights /root/autodl-tmp/olmoearth_pretrain/weights/OlmoEarth-v1_2-Base \
   --task single \
-  --ckpt runs/ubc_single/best.pt \
+  --ckpt runs/ubc_single_256/best.pt \
   --split val \
-  --out-json runs/ubc_single/val_predictions.json \
-  --tile-size 128 \
+  --out-json runs/ubc_single_256/val_predictions.json \
+  --tile-size 256 \
   --patch-size 4 \
-  --stride 96 \
+  --stride 128 \
   --tile-batch-size 4
 ```
 
 输出文件：
 
 ```text
-runs/ubc_single/val_predictions.json
-runs/ubc_single/val_predictions.metrics.json
+runs/ubc_single_256/val_predictions.json
+runs/ubc_single_256/val_predictions.metrics.json
 ```
 
 ## 6. 单模态 test 本地评测
@@ -162,12 +166,12 @@ python scripts/tools/train_ubc_roof_instance.py eval \
   --data-root /root/autodl-tmp/UBC_v2.0 \
   --weights /root/autodl-tmp/olmoearth_pretrain/weights/OlmoEarth-v1_2-Base \
   --task single \
-  --ckpt runs/ubc_single/best.pt \
+  --ckpt runs/ubc_single_256/best.pt \
   --split test \
-  --out-json runs/ubc_single/test_predictions.json \
-  --tile-size 128 \
+  --out-json runs/ubc_single_256/test_predictions.json \
+  --tile-size 256 \
   --patch-size 4 \
-  --stride 96 \
+  --stride 128 \
   --tile-batch-size 4
 ```
 
@@ -196,7 +200,10 @@ python scripts/tools/train_ubc_roof_instance.py train \
   --epochs 1 \
   --max-train-images 8 \
   --val-max-images 2 \
-  --samples-per-image 1 \
+  --samples-per-image 4 \
+  --balanced-extra-samples 1 \
+  --tile-size 256 \
+  --stride 128 \
   --batch-size 1 \
   --accum-steps 1 \
   --tile-batch-size 1 \
@@ -212,23 +219,24 @@ python scripts/tools/train_ubc_roof_instance.py train \
   --data-root /root/autodl-tmp/UBC_v2.0 \
   --weights /root/autodl-tmp/olmoearth_pretrain/weights/OlmoEarth-v1_2-Base \
   --task multimodal \
-  --init-ckpt runs/ubc_single/best.pt \
+  --init-ckpt runs/ubc_single_256/best.pt \
   --out-dir runs/ubc_multimodal \
   --epochs 24 \
   --batch-size 2 \
   --accum-steps 4 \
   --workers 4 \
-  --samples-per-image 2 \
-  --tile-size 128 \
+  --samples-per-image 4 \
+  --balanced-extra-samples 1 \
+  --tile-size 256 \
   --patch-size 4 \
-  --stride 96 \
+  --stride 128 \
   --tile-batch-size 2 \
   --eval-every 4 \
   --val-max-images 0 \
   --lr 0.0002
 ```
 
-`--val-max-images 0` 表示每次使用完整的 1681 张多模态验证影像，约处理 42025 个 RGB/SAR 对齐滑窗。
+`--val-max-images 0` 表示每次使用完整的 1681 张多模态验证影像，共处理 15129 个 RGB/SAR 对齐滑窗。
 
 ## 9. 多模态完整验证
 
@@ -240,9 +248,9 @@ python scripts/tools/train_ubc_roof_instance.py eval \
   --ckpt runs/ubc_multimodal/best.pt \
   --split val \
   --out-json runs/ubc_multimodal/val_predictions.json \
-  --tile-size 128 \
+  --tile-size 256 \
   --patch-size 4 \
-  --stride 96 \
+  --stride 128 \
   --tile-batch-size 2
 ```
 
@@ -256,9 +264,9 @@ python scripts/tools/train_ubc_roof_instance.py eval \
   --ckpt runs/ubc_multimodal/best.pt \
   --split test \
   --out-json runs/ubc_multimodal/test_predictions.json \
-  --tile-size 128 \
+  --tile-size 256 \
   --patch-size 4 \
-  --stride 96 \
+  --stride 128 \
   --tile-batch-size 2
 ```
 
@@ -271,16 +279,17 @@ python scripts/tools/train_ubc_roof_instance.py train \
   --data-root /root/autodl-tmp/UBC_v2.0 \
   --weights /root/autodl-tmp/olmoearth_pretrain/weights/OlmoEarth-v1_2-Base \
   --task single \
-  --out-dir runs/ubc_single \
-  --resume runs/ubc_single/last.pt \
+  --out-dir runs/ubc_single_256 \
+  --resume runs/ubc_single_256/last.pt \
   --epochs 24 \
-  --batch-size 4 \
+  --batch-size 2 \
   --accum-steps 2 \
   --workers 4 \
-  --samples-per-image 2 \
-  --tile-size 128 \
+  --samples-per-image 4 \
+  --balanced-extra-samples 1 \
+  --tile-size 256 \
   --patch-size 4 \
-  --stride 96 \
+  --stride 128 \
   --tile-batch-size 4 \
   --eval-every 4 \
   --val-max-images 0 \
@@ -298,12 +307,12 @@ python scripts/tools/train_ubc_roof_instance.py predict \
   --data-root /root/autodl-tmp/UBC_v2.0 \
   --weights /root/autodl-tmp/olmoearth_pretrain/weights/OlmoEarth-v1_2-Base \
   --task single \
-  --ckpt runs/ubc_single/best.pt \
+  --ckpt runs/ubc_single_256/best.pt \
   --split test \
-  --out-json runs/ubc_single/test_predictions_only.json \
-  --tile-size 128 \
+  --out-json runs/ubc_single_256/test_predictions_only.json \
+  --tile-size 256 \
   --patch-size 4 \
-  --stride 96 \
+  --stride 128 \
   --tile-batch-size 4
 ```
 
@@ -321,7 +330,7 @@ python scripts/tools/train_ubc_roof_instance.py predict \
 --tile-batch-size 1
 ```
 
-不要为了降低显存把整幅 `512×512` 影像缩放到 `128×128`，否则小建筑和屋顶边界会明显损失。
+不要为了降低显存而缩放整幅 `512×512` 影像，否则小建筑和屋顶边界会明显损失。
 
 如果 GPU 不支持 bfloat16，可以关闭自动混合精度：
 
@@ -334,29 +343,35 @@ python scripts/tools/train_ubc_roof_instance.py predict \
 默认设置为：
 
 ```text
-窗口：128×128
-步长：96
-重叠：32 像素
+窗口：256×256
+步长：128
+重叠：128 像素
 ```
 
 程序会自动：
 
-1. 将一张 `512×512` 影像划分为 25 个滑窗。
+1. 将一张 `512×512` 影像划分为 9 个滑窗。
 2. 分别运行 OlmoEarth 和 Mask R-CNN。
 3. 把局部边界框和掩膜恢复到原图坐标。
-4. 使用同类别 Mask-NMS 去除重复实例。
-5. 使用跨类别 Mask-NMS 去除同一建筑的类别冲突结果。
-6. 使用包含率校验清理被窗口边缘截断的重复掩膜。
-7. 输出完整的 COCO RLE 实例结果。
+4. 每个窗口最多保留 150 个实例，RPN 测试阶段最多保留 400 个候选。
+5. 在生成全图掩膜前使用快速的分类别 Box-NMS 清理重复候选。
+6. 对跨窗口、同类别且触碰窗口边界的掩膜片段进行联合。
+7. 使用同类别、跨类别和包含率 Mask-NMS 清理剩余重复结果。
+8. 输出完整的 COCO RLE 实例结果。
 
 相关默认阈值为：
 
 ```text
 --score-threshold 0.05
 --mask-threshold 0.5
+--box-nms 0.8
+--pre-mask-nms-topk 1000
 --same-class-nms 0.5
 --cross-class-nms 0.7
 --containment-nms 0.85
+--mask-merge-iou 0.2
+--mask-merge-containment 0.5
+--tile-border-margin 3
 --max-instances 500
 ```
 
