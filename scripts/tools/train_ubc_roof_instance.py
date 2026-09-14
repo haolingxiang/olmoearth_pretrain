@@ -41,6 +41,7 @@ from olmoearth_pretrain.model_loader import load_model_from_path
 
 
 TaskName = Literal["single", "multimodal"]
+S2RgbMode = Literal["rgb-only", "repeat"]
 NUM_CLASSES = 13  # background + the 12 UBC roof categories
 S2_DN_MAX = 10_000.0
 
@@ -389,6 +390,7 @@ class OlmoEarthPyramid(nn.Module):
         task: TaskName,
         patch_size: int,
         embedding_size: int,
+        s2_rgb_mode: S2RgbMode,
     ) -> None:
         super().__init__()
         # Instance segmentation only needs the pretrained encoder. Keeping the
@@ -397,6 +399,7 @@ class OlmoEarthPyramid(nn.Module):
         self.encoder = olmo.encoder
         self.task = task
         self.patch_size = patch_size
+        self.s2_rgb_mode = s2_rgb_mode
         for parameter in self.encoder.parameters():
             parameter.requires_grad = False
         self.encoder.eval()
@@ -438,12 +441,18 @@ class OlmoEarthPyramid(nn.Module):
         s2 = torch.zeros(
             (batch, height, width, 1, 12), device=images.device, dtype=images.dtype
         )
-        # PIL gives R,G,B. OlmoEarth expects B02,B03,B04 at indices 0,1,2.
-        s2[..., 0, 0] = rgb[:, 2] * (S2_DN_MAX / 255.0)
-        s2[..., 0, 1] = rgb[:, 1] * (S2_DN_MAX / 255.0)
-        s2[..., 0, 2] = rgb[:, 0] * (S2_DN_MAX / 255.0)
+        # PIL gives R,G,B. The first three OlmoEarth S2-L2A channels are
+        # B02,B03,B04, so use B,G,R as the source triplet. ``repeat`` is an
+        # explicit experimental mode that repeats that triplet four times to
+        # fill all 12 S2 channels: B,G,R,B,G,R,B,G,R,B,G,R.
+        bgr = rgb[:, [2, 1, 0]].permute(0, 2, 3, 1) * (S2_DN_MAX / 255.0)
+        if self.s2_rgb_mode == "repeat":
+            s2[..., 0, :] = bgr.repeat(1, 1, 1, 4)
+        else:
+            s2[..., 0, :3] = bgr
         s2 = (s2 - self.s2_low) / self.s2_range.clamp_min(1e-6)
-        s2[..., 3:] = 0  # restore padded channels after normalization
+        if self.s2_rgb_mode == "rgb-only":
+            s2[..., 3:] = 0  # restore padded channels after normalization
         online = float(MaskValue.ONLINE_ENCODER.value)
         kwargs: dict[str, Any] = {
             "sentinel2_l2a": s2,
@@ -499,6 +508,7 @@ def build_model(
     task: TaskName,
     tile_size: int,
     patch_size: int,
+    s2_rgb_mode: S2RgbMode,
     device: torch.device,
 ) -> MaskRCNN:
     print(f"loading frozen OlmoEarth backbone from {weights}")
@@ -508,7 +518,9 @@ def build_model(
     olmo = load_model_from_path(weights)
     config = json.loads((weights / "config.json").read_text(encoding="utf-8"))
     embedding_size = int(config["model"]["encoder_config"]["embedding_size"])
-    backbone = OlmoEarthPyramid(olmo, task, patch_size, embedding_size)
+    backbone = OlmoEarthPyramid(
+        olmo, task, patch_size, embedding_size, s2_rgb_mode
+    )
     feature_names = ["0", "1", "2", "3"]
     anchors = AnchorGenerator(
         sizes=((8,), (16,), (32,), (64,)),
@@ -584,6 +596,7 @@ def save_checkpoint(
             "task": args.task,
             "tile_size": args.tile_size,
             "patch_size": args.patch_size,
+            "s2_rgb_mode": args.s2_rgb_mode,
             "model": trainable_state_dict(model),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -985,7 +998,7 @@ def evaluate_coco(
 
 
 def _checkpoint_args(checkpoint: dict[str, Any], args: argparse.Namespace) -> None:
-    for name in ("task", "tile_size", "patch_size"):
+    for name in ("task", "tile_size", "patch_size", "s2_rgb_mode"):
         expected = checkpoint.get(name)
         actual = getattr(args, name)
         if expected is not None and expected != actual:
@@ -1028,7 +1041,12 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_detection,
     )
     model = build_model(
-        Path(args.weights), args.task, args.tile_size, args.patch_size, device
+        Path(args.weights),
+        args.task,
+        args.tile_size,
+        args.patch_size,
+        args.s2_rgb_mode,
+        device,
     )
     if args.init_ckpt:
         checkpoint = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
@@ -1201,7 +1219,12 @@ def load_for_inference(
     checkpoint = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     _checkpoint_args(checkpoint, args)
     model = build_model(
-        Path(args.weights), args.task, args.tile_size, args.patch_size, device
+        Path(args.weights),
+        args.task,
+        args.tile_size,
+        args.patch_size,
+        args.s2_rgb_mode,
+        device,
     )
     load_trainable_state(model, checkpoint)
     model.eval()
@@ -1265,6 +1288,15 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task", choices=("single", "multimodal"), required=True)
     parser.add_argument("--tile-size", type=int, default=256)
     parser.add_argument("--patch-size", type=int, default=4, choices=range(1, 9))
+    parser.add_argument(
+        "--s2-rgb-mode",
+        choices=("rgb-only", "repeat"),
+        default="rgb-only",
+        help=(
+            "rgb-only maps B,G,R to S2 B02,B03,B04 and zeros other bands; "
+            "repeat fills all 12 S2 channels with four B,G,R repetitions"
+        ),
+    )
     parser.add_argument("--device", default=None, help="Default: cuda when available")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
