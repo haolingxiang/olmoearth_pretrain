@@ -1446,14 +1446,15 @@ def _train_impl(
     if distributed:
         for parameter in model.parameters():
             parameter.data = parameter.data.contiguous()
-        # Bridge every trainable param into the loss each step so the used-param
-        # set is identical across ranks. That lets us keep find_unused=False and
-        # use no_sync() for accumulation (required for correct/fast DDP).
+        # Cascade leaves a stable set of unused params every step. Use
+        # find_unused_parameters=True so the reducer does not wait forever.
+        # Do NOT use no_sync() with this setting — micro-step bookkeeping and
+        # unused-param detection deadlock on the first synchronizing backward.
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             broadcast_buffers=False,
             static_graph=False,
         )
@@ -1510,8 +1511,7 @@ def _train_impl(
         print(f"parameters: trainable={trainable:,}, frozen={frozen:,}")
         if distributed:
             print(
-                "ddp: find_unused_parameters=False, flash SDPA enabled, "
-                "param-bridge + no_sync accumulation",
+                "ddp: find_unused_parameters=True, flash SDPA, sync every micro-step",
                 flush=True,
             )
     history_path = out_dir / "history.json"
@@ -1548,36 +1548,21 @@ def _train_impl(
                 {key: value.to(device, non_blocking=True) for key, value in target.items()}
                 for target in targets
             ]
+            # Always synchronize under DDP. no_sync + find_unused_parameters is
+            # what made step 1 look fine and step 2 hang on NCCL forever.
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=args.amp and device.type == "cuda",
+            ):
+                loss_dict = model(images, targets)
+                loss = sum(loss_dict.values()) / args.accum_steps
+            if not torch.isfinite(loss.detach()):
+                raise RuntimeError(
+                    f"non-finite loss at epoch={epoch} step={step}: {loss_dict}"
+                )
+            loss.backward()
             syncing = step % args.accum_steps == 0 or step == len(loader)
-            # find_unused=False + param bridge allows no_sync on micro-steps.
-            sync_context = (
-                model.no_sync() if distributed and not syncing else nullcontext()
-            )
-            with sync_context:
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=args.amp and device.type == "cuda",
-                ):
-                    loss_dict = model(images, targets)
-                    loss = sum(loss_dict.values()) / args.accum_steps
-                    if distributed:
-                        # Cheap scalar touch so every trainable weight is marked
-                        # used. Never do ``(p * 0).sum()`` over full tensors —
-                        # that would allocate another ~backbone-sized buffer.
-                        bridge = None
-                        for parameter in raw_model.parameters():
-                            if not parameter.requires_grad:
-                                continue
-                            piece = parameter.reshape(-1)[:1].float().sum() * 0.0
-                            bridge = piece if bridge is None else bridge + piece
-                        if bridge is not None:
-                            loss = loss + bridge
-                if not torch.isfinite(loss.detach()):
-                    raise RuntimeError(
-                        f"non-finite loss at epoch={epoch} step={step}: {loss_dict}"
-                    )
-                loss.backward()
             if syncing:
                 global_step += 1
                 epoch_steps += 1
