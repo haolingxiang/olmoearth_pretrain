@@ -1855,6 +1855,8 @@ def add_inference(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    # torchrun may inject this; we read rank from the environment instead.
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=-1)
     commands = parser.add_subparsers(dest="command", required=True)
 
     train_parser = commands.add_parser(
@@ -1934,6 +1936,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="warm-start compatible heads (e.g. multimodal from a single checkpoint)",
     )
+    train_parser.add_argument("--local-rank", "--local_rank", type=int, default=-1)
+    train_parser.add_argument(
+        "--ddp-find-unused",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    train_parser.add_argument(
+        "--ddp-static-graph",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     for name in ("eval", "predict"):
         sub = commands.add_parser(name)
@@ -1995,6 +2008,18 @@ def validate_args(args: argparse.Namespace) -> None:
         parse_eval_scales(args.eval_scales)
         if args.log_every < 1:
             raise ValueError("--log-every must be positive")
+        if getattr(args, "ddp_static_graph", False):
+            print(
+                "warning: --ddp-static-graph is ignored; it is incompatible with "
+                "gradient accumulation and previously produced NaN grads",
+                flush=True,
+            )
+        if getattr(args, "ddp_find_unused", False):
+            print(
+                "warning: --ddp-find-unused is ignored; mismatched unused-parameter "
+                "sets deadlock DDP on this model",
+                flush=True,
+            )
     if hasattr(args, "pre_mask_nms_topk") and args.pre_mask_nms_topk < 1:
         raise ValueError("--pre-mask-nms-topk must be positive")
     if hasattr(args, "tile_border_margin") and args.tile_border_margin < 1:
@@ -2006,7 +2031,15 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args, unknown = parser.parse_known_args()
+    leftover = [
+        token
+        for token in unknown
+        if not token.startswith("--local-rank") and not token.startswith("--local_rank")
+    ]
+    if leftover:
+        parser.error(f"unrecognized arguments: {' '.join(leftover)}")
     validate_args(args)
     if args.command == "train":
         train(args)
