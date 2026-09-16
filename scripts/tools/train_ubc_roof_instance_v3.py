@@ -1485,13 +1485,16 @@ def _train_impl(
                 if isinstance(row, dict) and int(row.get("epoch", 0)) < start_epoch
             ]
 
+    global_step = 0
     for epoch in range(start_epoch, args.epochs + 1):
         if sampler is not None:
             sampler.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        epoch_lrs = [group["lr"] for group in optimizer.param_groups]
         totals: Counter[str] = Counter()
         batches = 0
+        skipped_steps = 0
         started = time.time()
         progress = tqdm(
             loader,
@@ -1513,25 +1516,43 @@ def _train_impl(
                 loss = sum(loss_dict.values()) / args.accum_steps
             scaler.scale(loss).backward()
             if step % args.accum_steps == 0 or step == len(loader):
+                global_step += 1
+                # Linear warmup: the freshly initialised cascade heads produce
+                # huge early gradients on top of an unfrozen encoder.
+                warmup = min(1.0, global_step / max(args.warmup_iters, 1))
+                for group, epoch_lr in zip(
+                    optimizer.param_groups, epoch_lrs, strict=True
+                ):
+                    group["lr"] = epoch_lr * warmup
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(parameters, args.clip_grad_norm)
-                scaler.step(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters, args.clip_grad_norm
+                )
+                # DDP has already all-reduced the grads, so every rank sees the
+                # same norm and skips in lockstep. Stepping on a non-finite norm
+                # turns the weights into NaN permanently.
+                if torch.isfinite(grad_norm):
+                    scaler.step(optimizer)
+                else:
+                    skipped_steps += 1
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-            for name, value in loss_dict.items():
-                totals[name] += float(value.detach())
-            totals["loss"] += float(sum(loss_dict.values()).detach())
-            batches += 1
+            if torch.isfinite(loss.detach()):
+                for name, value in loss_dict.items():
+                    totals[name] += float(value.detach())
+                totals["loss"] += float(sum(loss_dict.values()).detach())
+                batches += 1
             if is_main_process(rank) and (
                 step % args.log_every == 0 or step == len(loader)
             ):
+                denominator = max(batches, 1)
                 postfix = {
-                    "loss": f"{totals['loss'] / batches:.4f}",
-                    "cls": f"{totals['loss_classifier'] / batches:.4f}",
-                    "box": f"{totals['loss_box_reg'] / batches:.4f}",
-                    "mask": f"{totals['loss_mask'] / batches:.4f}",
-                    "obj": f"{totals['loss_objectness'] / batches:.4f}",
-                    "rpn_box": f"{totals['loss_rpn_box_reg'] / batches:.4f}",
+                    "loss": f"{totals['loss'] / denominator:.4f}",
+                    "cls": f"{totals['loss_classifier'] / denominator:.4f}",
+                    "box": f"{totals['loss_box_reg'] / denominator:.4f}",
+                    "mask": f"{totals['loss_mask'] / denominator:.4f}",
+                    "obj": f"{totals['loss_objectness'] / denominator:.4f}",
+                    "rpn_box": f"{totals['loss_rpn_box_reg'] / denominator:.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
                 progress.set_postfix(postfix, refresh=True)
@@ -1542,14 +1563,18 @@ def _train_impl(
                     f"loss={postfix['loss']} cls={postfix['cls']} "
                     f"box={postfix['box']} mask={postfix['mask']} "
                     f"obj={postfix['obj']} rpn_box={postfix['rpn_box']} "
-                    f"lr={postfix['lr']}",
+                    f"lr={postfix['lr']} skipped={skipped_steps}",
                     flush=True,
                 )
+        # Undo the warmup scaling so the cosine schedule sees its own lrs.
+        for group, epoch_lr in zip(optimizer.param_groups, epoch_lrs, strict=True):
+            group["lr"] = epoch_lr
         scheduler.step()
         row: dict[str, Any] = {
             "epoch": epoch,
             "seconds": time.time() - started,
             "lr": scheduler.get_last_lr()[0],
+            "skipped_steps": skipped_steps,
             **{name: value / max(batches, 1) for name, value in totals.items()},
         }
         metrics: dict[str, float] | None = None
@@ -1852,6 +1877,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_parser.add_argument("--weight-decay", type=float, default=1e-4)
     train_parser.add_argument("--clip-grad-norm", type=float, default=5.0)
+    train_parser.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=500,
+        help="optimizer steps of linear lr warmup; 0 disables",
+    )
     train_parser.add_argument(
         "--log-every",
         type=int,

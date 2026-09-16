@@ -19,13 +19,32 @@ from torchvision.models.detection.roi_heads import (
 )
 from torchvision.ops import boxes as box_ops
 
+MIN_BOX_SIZE = 2.0
+
+
+def _sanitize_boxes(boxes: Tensor, shape: tuple[int, int]) -> Tensor:
+    """Clip to the image and guarantee a positive width/height.
+
+    Cascade stages feed refined boxes back in as proposals. A zero-width box
+    makes ``BoxCoder.encode`` divide by zero, which turns the regression
+    targets into ``inf`` and poisons every subsequent step with NaN.
+    """
+    height, width = shape
+    boxes = torch.nan_to_num(boxes, nan=0.0, posinf=0.0, neginf=0.0)
+    x1, y1, x2, y2 = boxes.unbind(-1)
+    x1 = x1.clamp(0.0, max(width - MIN_BOX_SIZE, 0.0))
+    y1 = y1.clamp(0.0, max(height - MIN_BOX_SIZE, 0.0))
+    x2 = torch.maximum(x2, x1 + MIN_BOX_SIZE).clamp(max=float(width))
+    y2 = torch.maximum(y2, y1 + MIN_BOX_SIZE).clamp(max=float(height))
+    return torch.stack((x1, y1, x2, y2), dim=-1)
+
 
 class SeesawLoss(nn.Module):
     """Seesaw Cross-Entropy for long-tailed classification (CVPR 2021).
 
-    Background class (label 0) is kept; mitigation / compensation act on the
-    full logit vector including background, matching common Cascade+Seesaw
-    practice for instance segmentation.
+    Follows the mmdet formulation: the mitigation and compensation factors are
+    added to the logits in log space, and the background class is excluded from
+    re-weighting so negatives keep contributing a normal cross-entropy signal.
     """
 
     def __init__(
@@ -45,35 +64,39 @@ class SeesawLoss(nn.Module):
     def forward(self, cls_score: Tensor, labels: Tensor) -> Tensor:
         if cls_score.numel() == 0:
             return cls_score.sum() * 0.0
-        labels = labels.long()
-        for class_id in labels.unique():
-            idx = int(class_id.item())
-            if 0 <= idx < self.num_classes:
-                self.cum_samples[idx] += float((labels == class_id).sum().item())
+        cls_score = cls_score.float()
+        labels = labels.long().clamp(0, self.num_classes - 1)
+        with torch.no_grad():
+            self.cum_samples += torch.bincount(
+                labels, minlength=self.num_classes
+            ).to(self.cum_samples)
 
-        sample_ratio = self.cum_samples[:, None] / self.cum_samples.clamp_min(1.0)[None, :]
-        # Mitigation: down-weight gradients of frequent negative classes.
-        mitigation = sample_ratio.pow(self.p)
-        mitigation = torch.where(sample_ratio < 1.0, mitigation, torch.ones_like(mitigation))
-        # Compensation: boost rare true classes when their score is low.
-        score = cls_score.softmax(dim=-1).detach()
-        true_score = score[torch.arange(labels.numel(), device=labels.device), labels]
-        compensation = (true_score.clamp_min(self.eps).unsqueeze(1) / score.clamp_min(self.eps)).pow(
-            self.q
-        )
-        # sample_ratio[true, :] < 1 → true class rarer than column class
-        compensation = torch.where(
-            sample_ratio[labels] < 1.0,
-            compensation,
-            torch.ones_like(compensation),
-        )
-        weights = mitigation[labels] * compensation
+        counts = self.cum_samples.clamp_min(1.0)
+        # mitigation[i, j] = (n_j / n_i) ** p when class j is rarer than class i.
+        ratio = counts[None, :] / counts[:, None]
+        mitigation = torch.where(ratio < 1.0, ratio.pow(self.p), torch.ones_like(ratio))
+        weights = mitigation[labels]
+
+        if self.q > 0.0:
+            score = cls_score.detach().softmax(dim=-1)
+            true_score = score.gather(1, labels[:, None]).clamp_min(self.eps)
+            # Boost class j only when it currently outscores the true class.
+            score_ratio = score / true_score
+            weights = weights * torch.where(
+                score_ratio > 1.0, score_ratio.pow(self.q), torch.ones_like(score_ratio)
+            )
+
         one_hot = F.one_hot(labels, self.num_classes).float()
-        # Leave the true-class channel unweighted (standard Seesaw CE form).
-        weights = weights * (1.0 - one_hot) + one_hot
-        log_prob = F.log_softmax(cls_score, dim=-1)
-        loss = -(one_hot * log_prob * weights).sum(dim=-1)
-        return loss.mean()
+        # Background rows/columns keep plain cross-entropy: the background prior
+        # dwarfs every roof class and would otherwise erase the negative signal.
+        keep = one_hot.bool() | (labels == 0)[:, None]
+        keep[:, 0] = True
+        weights = torch.where(keep, torch.ones_like(weights), weights)
+        weights = weights.clamp(1e-4, 1e4)
+        # Seesaw applies its weights additively in logit space (mmdet form),
+        # which is far better conditioned than scaling the log-probabilities.
+        adjusted = cls_score + weights.log() * (1.0 - one_hot)
+        return F.cross_entropy(adjusted, labels)
 
 
 def cascade_fastrcnn_loss(
@@ -225,29 +248,22 @@ class CascadeRoIHeads(RoIHeads):
         image_shapes: list[tuple[int, int]],
     ) -> list[Tensor]:
         boxes_per_image = [p.shape[0] for p in proposals]
-        # torchvision BoxCoder.decode returns Tensor[N, num_classes * 4] then
-        # reshapes; check actual API — decode(rel_codes, boxes) -> Tensor[N, 4]
-        # when box_regression is [N, num_classes * 4], output is [N, num_classes, 4]
         pred_boxes = self.box_coder.decode(box_regression, proposals)
+        parts = pred_boxes.split(boxes_per_image, 0)
         if pred_boxes.ndim == 2:
-            # unexpected; split directly
-            parts = pred_boxes.split(boxes_per_image, 0)
             return [
-                box_ops.clip_boxes_to_image(part.detach(), shape)
+                _sanitize_boxes(part.detach(), shape)
                 for part, shape in zip(parts, image_shapes, strict=True)
             ]
-        parts = pred_boxes.split(boxes_per_image, 0)
         refined = []
         for part, label, shape, proposal in zip(
             parts, labels, image_shapes, proposals, strict=True
         ):
             # part: [N, C, 4]
             idx = torch.arange(part.shape[0], device=part.device)
-            class_ids = label.clamp(min=0)
-            boxes = part[idx, class_ids]
-            boxes = boxes.clone()
+            boxes = part[idx, label.clamp(min=0)].clone()
             boxes[label <= 0] = proposal[label <= 0]
-            refined.append(box_ops.clip_boxes_to_image(boxes.detach(), shape))
+            refined.append(_sanitize_boxes(boxes.detach(), shape))
         return refined
 
     def forward(
