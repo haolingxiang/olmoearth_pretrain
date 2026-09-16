@@ -99,6 +99,30 @@ class SeesawLoss(nn.Module):
         return F.cross_entropy(adjusted, labels)
 
 
+def _zero_coupling(modules: list[nn.Module]) -> Tensor:
+    """Keep every listed module in the autograd graph.
+
+    Detection heads skip a branch when a rank has no positives. Under DDP with
+    ``find_unused_parameters=False`` that rank then never produces a grad for
+    those weights, the reducer waits forever, and the other rank looks frozen.
+    Adding a 0-valued view of each parameter makes the graph identical.
+    """
+    total: Tensor | None = None
+    seen: set[int] = set()
+    for module in modules:
+        if module is None:
+            continue
+        for parameter in module.parameters():
+            if id(parameter) in seen:
+                continue
+            seen.add(id(parameter))
+            piece = parameter.reshape(-1)[:1].sum() * 0.0
+            total = piece if total is None else total + piece
+    if total is None:
+        raise RuntimeError("cascade heads have no parameters to couple")
+    return total
+
+
 def cascade_fastrcnn_loss(
     class_logits: Tensor,
     box_regression: Tensor,
@@ -106,6 +130,9 @@ def cascade_fastrcnn_loss(
     regression_targets: list[Tensor],
     seesaw: SeesawLoss | None,
 ) -> tuple[Tensor, Tensor]:
+    if class_logits.numel() == 0:
+        zero = class_logits.sum() * 0.0 + box_regression.sum() * 0.0
+        return zero, zero
     labels_cat = torch.cat(labels, dim=0)
     regression_targets_cat = torch.cat(regression_targets, dim=0)
     if seesaw is None:
@@ -352,6 +379,16 @@ class CascadeRoIHeads(RoIHeads):
                 gt_labels = [t["labels"] for t in targets]
                 losses["loss_mask"] = maskrcnn_loss(
                     mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs
+                )
+                # Touch every cascade / mask parameter so DDP ranks always agree
+                # on the used-parameter set, even when a stage has no positives.
+                losses["loss_classifier"] = losses["loss_classifier"] + _zero_coupling(
+                    [
+                        *list(self.box_heads),
+                        *list(self.box_predictors),
+                        self.mask_head,
+                        self.mask_predictor,
+                    ]
                 )
             else:
                 mask_proposals = [row["boxes"] for row in result]

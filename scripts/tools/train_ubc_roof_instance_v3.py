@@ -15,6 +15,7 @@ import argparse
 from collections import Counter, OrderedDict, defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 import json
 import math
 import os
@@ -378,12 +379,14 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
                 )
             local_area = int(local.sum())
             full_area = max(float(ann.get("area", full_mask.sum())), 1.0)
-            if local_area < self.min_mask_area:
-                continue
             is_focus_target = (
                 target_annotation is not None
                 and int(ann["id"]) == int(target_annotation["id"])
             )
+            if local_area == 0:
+                continue
+            if local_area < self.min_mask_area and not is_focus_target:
+                continue
             if local_area / full_area < self.min_visible_fraction and not is_focus_target:
                 continue
             masks.append(local)
@@ -425,13 +428,14 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         # An empty crop makes the mask branch parameter-free for this rank only,
         # which deadlocks DDP's unused-parameter handshake. Force a target.
         retries = 0
-        while (
-            self.require_instances
-            and not masks
-            and retries < 8
-            and self.annotated_image_ids
-        ):
+        while self.require_instances and not masks:
+            if not self.annotated_image_ids:
+                raise RuntimeError("DDP training needs at least one annotated image")
             retries += 1
+            if retries > 32:
+                raise RuntimeError(
+                    "failed to sample a crop with instances; DDP cannot train on empty targets"
+                )
             row = self.index.image_by_id[random.choice(self.annotated_image_ids)]
             target_annotation = random.choice(
                 self.index.annotations_by_image[int(row["id"])]
@@ -1305,8 +1309,13 @@ def setup_distributed() -> tuple[bool, int, int, int]:
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(local_rank)
-    # Pass device_id so NCCL knows the rank→GPU mapping (avoids hang warnings).
-    dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
+    # Fail fast on NCCL desync instead of hanging until the cluster kills the job.
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device("cuda", local_rank),
+        timeout=timedelta(minutes=60),
+    )
     return True, local_rank, rank, world_size
 
 
@@ -1380,7 +1389,12 @@ def _train_impl(
     sampler: DistributedSampler | None = None
     if distributed:
         sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
         )
     loader = DataLoader(
         dataset,
@@ -1390,6 +1404,7 @@ def _train_impl(
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.workers > 0,
+        drop_last=distributed,
         collate_fn=collate_detection,
     )
     class_counts = collect_class_counts(train_index, NUM_CLASSES)
@@ -1411,17 +1426,21 @@ def _train_impl(
         checkpoint = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
         load_trainable_state(model, checkpoint)
     if distributed:
-        # Reduce DDP "grad strides do not match bucket view strides" noise/overhead.
-        for parameter in model.parameters():
-            parameter.data = parameter.data.contiguous()
+        # Empty crops and unused cascade stages are handled in the dataset /
+        # ROI heads, so the graph is the same on every rank. Do not turn on
+        # find_unused_parameters: mismatched unused sets deadlock NCCL.
+        # static_graph is also off: it cannot coexist with gradient accumulation
+        # via no_sync(), which is what previously filled the buckets with garbage
+        # and produced non-finite encoder grads from step 1.
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=args.ddp_find_unused,
+            find_unused_parameters=False,
             broadcast_buffers=False,
-            static_graph=args.ddp_static_graph,
+            static_graph=False,
         )
+        dist.barrier()
     raw_model = unwrap_model(model)
     encoder_parameters = [
         parameter
@@ -1495,6 +1514,7 @@ def _train_impl(
         epoch_lrs = [group["lr"] for group in optimizer.param_groups]
         totals: Counter[str] = Counter()
         batches = 0
+        epoch_steps = 0
         skipped_steps = 0
         started = time.time()
         progress = tqdm(
@@ -1509,8 +1529,8 @@ def _train_impl(
                 for target in targets
             ]
             # Only all-reduce on the step that actually updates the weights.
-            # Reducing on every micro-step is both wasteful and, under
-            # static_graph, feeds DDP more backwards than it expects.
+            # Reducing on every micro-step both wastes bandwidth and gives DDP
+            # more backwards than it accounts for, which corrupted the buckets.
             syncing = step % args.accum_steps == 0 or step == len(loader)
             sync_context = (
                 model.no_sync() if distributed and not syncing else nullcontext()
@@ -1526,6 +1546,7 @@ def _train_impl(
                 scaler.scale(loss).backward()
             if syncing:
                 global_step += 1
+                epoch_steps += 1
                 # Linear warmup: the freshly initialised cascade heads produce
                 # huge early gradients on top of an unfrozen encoder.
                 warmup = min(1.0, global_step / max(args.warmup_iters, 1))
@@ -1537,13 +1558,22 @@ def _train_impl(
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     parameters, args.clip_grad_norm
                 )
-                # DDP has already all-reduced the grads, so every rank sees the
-                # same norm and skips in lockstep. Stepping on a non-finite norm
-                # turns the weights into NaN permanently.
-                if torch.isfinite(grad_norm):
+                finite = torch.tensor(
+                    1 if torch.isfinite(grad_norm) else 0,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                if distributed:
+                    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+                if int(finite.item()) == 1:
                     scaler.step(optimizer)
                 else:
                     skipped_steps += 1
+                    if skipped_steps >= 20 and skipped_steps == epoch_steps:
+                        raise RuntimeError(
+                            f"all {skipped_steps} optimizer steps had non-finite "
+                            "gradients; training cannot make progress"
+                        )
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
             if torch.isfinite(loss.detach()):
@@ -1860,16 +1890,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="probability of pasting a rare-class instance onto the crop",
     )
-    train_parser.add_argument(
-        "--ddp-find-unused",
-        action="store_true",
-        help="enable DDP unused-parameter search (slow, deadlocks if ranks disagree)",
-    )
-    train_parser.add_argument(
-        "--ddp-static-graph",
-        action="store_true",
-        help="declare the DDP graph static (faster, requires identical graph every step)",
-    )
     train_parser.add_argument("--min-visible-fraction", type=float, default=0.5)
     train_parser.add_argument("--min-mask-area", type=int, default=4)
     train_parser.add_argument("--lr", type=float, default=2e-4)
@@ -1970,11 +1990,6 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--eval-every must be positive")
         if args.backbone_lr <= 0:
             raise ValueError("--backbone-lr must be positive")
-        if args.ddp_static_graph and args.accum_steps > 1:
-            raise ValueError(
-                "--ddp-static-graph is incompatible with gradient accumulation, "
-                "which needs DDP no_sync(); drop one of them"
-            )
         if not 0 <= args.copy_paste_probability <= 1:
             raise ValueError("--copy-paste-probability must be in [0, 1]")
         parse_eval_scales(args.eval_scales)
