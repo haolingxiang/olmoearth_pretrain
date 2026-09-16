@@ -1270,8 +1270,9 @@ def setup_distributed() -> tuple[bool, int, int, int]:
         return False, 0, 0, 1
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
-    dist.init_process_group(backend="nccl")
     torch.cuda.set_device(local_rank)
+    # Pass device_id so NCCL knows the rank→GPU mapping (avoids hang warnings).
+    dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
     return True, local_rank, rank, world_size
 
 
@@ -1375,6 +1376,9 @@ def _train_impl(
         checkpoint = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
         load_trainable_state(model, checkpoint)
     if distributed:
+        # Reduce DDP "grad strides do not match bucket view strides" noise/overhead.
+        for parameter in model.parameters():
+            parameter.data = parameter.data.contiguous()
         model = DDP(
             model,
             device_ids=[local_rank],
