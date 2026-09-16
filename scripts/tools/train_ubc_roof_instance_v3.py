@@ -1421,7 +1421,6 @@ def _train_impl(
             find_unused_parameters=args.ddp_find_unused,
             broadcast_buffers=False,
             static_graph=args.ddp_static_graph,
-            gradient_as_bucket_view=True,
         )
     raw_model = unwrap_model(model)
     encoder_parameters = [
@@ -1441,7 +1440,9 @@ def _train_impl(
         groups.append({"params": encoder_parameters, "lr": args.backbone_lr})
     optimizer = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
+    # Autocast runs in bfloat16, whose exponent range matches float32, so loss
+    # scaling buys nothing and only adds an in-place unscale of every gradient.
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
     start_epoch = 1
     best_ap50 = -1.0
     if args.resume:
@@ -1535,6 +1536,18 @@ def _train_impl(
                     scaler.step(optimizer)
                 else:
                     skipped_steps += 1
+                    if is_main_process(rank) and skipped_steps <= 3:
+                        bad = [
+                            name
+                            for name, parameter in raw_model.named_parameters()
+                            if parameter.grad is not None
+                            and not torch.isfinite(parameter.grad).all()
+                        ]
+                        print(
+                            f"non-finite grads at step {step}: "
+                            f"{len(bad)} params, first={bad[:8]}",
+                            flush=True,
+                        )
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
             if torch.isfinite(loss.detach()):
