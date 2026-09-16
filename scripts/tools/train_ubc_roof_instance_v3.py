@@ -201,6 +201,7 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         augment: bool,
         max_images: int | None = None,
         copy_paste_probability: float = 0.0,
+        require_instances: bool = False,
     ) -> None:
         self.index = index
         self.images = (
@@ -216,6 +217,12 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         self.balanced_extra_samples = balanced_extra_samples
         self.augment = augment
         self.copy_paste_probability = copy_paste_probability
+        self.require_instances = require_instances
+        self.annotated_image_ids = [
+            int(row["id"])
+            for row in self.images
+            if index.annotations_by_image[int(row["id"])]
+        ]
         counts = Counter(
             int(ann["category_id"])
             for anns in index.annotations_by_image.values()
@@ -337,30 +344,9 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         original_areas.append(float(pasted.sum()))
         return crop, masks, labels, original_areas
 
-    def __getitem__(self, item: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        sample_slot = item // len(self.images)
-        row = self.images[item % len(self.images)]
-        target_annotation: dict[str, Any] | None = None
-        if (
-            self.balanced_extra_samples > 0
-            and sample_slot >= self.samples_per_image
-            and self.balanced_categories
-        ):
-            category_id = random.choices(
-                self.balanced_categories,
-                weights=self.balanced_category_weights,
-                k=1,
-            )[0]
-            target_annotation = random.choice(self.annotations_by_category[category_id])
-            row = self.index.image_by_id[int(target_annotation["image_id"])]
-        elif random.random() < self.object_crop_probability:
-            annotations = self.index.annotations_by_image[int(row["id"])]
-            if annotations:
-                weights = [
-                    self.class_weights[int(annotation["category_id"])]
-                    for annotation in annotations
-                ]
-                target_annotation = random.choices(annotations, weights=weights, k=1)[0]
+    def _extract(
+        self, row: dict[str, Any], target_annotation: dict[str, Any] | None
+    ) -> tuple[np.ndarray, list[np.ndarray], list[int], list[float]]:
         image = self.index.load_image(row)
         height, width = image.shape[:2]
         x0, y0 = self._crop_origin(row, target_annotation)
@@ -403,6 +389,54 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
             masks.append(local)
             labels.append(int(ann["category_id"]))
             original_areas.append(float(local_area))
+        return crop, masks, labels, original_areas
+
+    def _pick_row_and_target(
+        self, item: int
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        sample_slot = item // len(self.images)
+        row = self.images[item % len(self.images)]
+        target_annotation: dict[str, Any] | None = None
+        if (
+            self.balanced_extra_samples > 0
+            and sample_slot >= self.samples_per_image
+            and self.balanced_categories
+        ):
+            category_id = random.choices(
+                self.balanced_categories,
+                weights=self.balanced_category_weights,
+                k=1,
+            )[0]
+            target_annotation = random.choice(self.annotations_by_category[category_id])
+            row = self.index.image_by_id[int(target_annotation["image_id"])]
+        elif random.random() < self.object_crop_probability:
+            annotations = self.index.annotations_by_image[int(row["id"])]
+            if annotations:
+                weights = [
+                    self.class_weights[int(annotation["category_id"])]
+                    for annotation in annotations
+                ]
+                target_annotation = random.choices(annotations, weights=weights, k=1)[0]
+        return row, target_annotation
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        row, target_annotation = self._pick_row_and_target(item)
+        crop, masks, labels, original_areas = self._extract(row, target_annotation)
+        # An empty crop makes the mask branch parameter-free for this rank only,
+        # which deadlocks DDP's unused-parameter handshake. Force a target.
+        retries = 0
+        while (
+            self.require_instances
+            and not masks
+            and retries < 8
+            and self.annotated_image_ids
+        ):
+            retries += 1
+            row = self.index.image_by_id[random.choice(self.annotated_image_ids)]
+            target_annotation = random.choice(
+                self.index.annotations_by_image[int(row["id"])]
+            )
+            crop, masks, labels, original_areas = self._extract(row, target_annotation)
 
         if self.augment:
             crop, masks, labels, original_areas = self._copy_paste(
@@ -1341,6 +1375,7 @@ def _train_impl(
         augment=True,
         max_images=args.max_train_images,
         copy_paste_probability=args.copy_paste_probability,
+        require_instances=distributed,
     )
     sampler: DistributedSampler | None = None
     if distributed:
@@ -1383,8 +1418,10 @@ def _train_impl(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
+            find_unused_parameters=args.ddp_find_unused,
             broadcast_buffers=False,
+            static_graph=args.ddp_static_graph,
+            gradient_as_bucket_view=True,
         )
     raw_model = unwrap_model(model)
     encoder_parameters = [
@@ -1788,6 +1825,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help="probability of pasting a rare-class instance onto the crop",
+    )
+    train_parser.add_argument(
+        "--ddp-find-unused",
+        action="store_true",
+        help="enable DDP unused-parameter search (slow, deadlocks if ranks disagree)",
+    )
+    train_parser.add_argument(
+        "--ddp-static-graph",
+        action="store_true",
+        help="declare the DDP graph static (faster, requires identical graph every step)",
     )
     train_parser.add_argument("--min-visible-fraction", type=float, default=0.5)
     train_parser.add_argument("--min-mask-area", type=int, default=4)
