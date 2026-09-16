@@ -1426,17 +1426,15 @@ def _train_impl(
         checkpoint = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
         load_trainable_state(model, checkpoint)
     if distributed:
-        # Empty crops and unused cascade stages are handled in the dataset /
-        # ROI heads, so the graph is the same on every rank. Do not turn on
-        # find_unused_parameters: mismatched unused sets deadlock NCCL.
-        # static_graph is also off: it cannot coexist with gradient accumulation
-        # via no_sync(), which is what previously filled the buckets with garbage
-        # and produced non-finite encoder grads from step 1.
+        # Cascade / mask branches can leave a fixed set of params without grads
+        # on a given step. find_unused_parameters=True is safe here because both
+        # ranks see the same unused set (empty crops are rejected). Do not pair
+        # this with no_sync(); see the training loop below.
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             broadcast_buffers=False,
             static_graph=False,
         )
@@ -1528,22 +1526,19 @@ def _train_impl(
                 {key: value.to(device, non_blocking=True) for key, value in target.items()}
                 for target in targets
             ]
-            # Only all-reduce on the step that actually updates the weights.
-            # Reducing on every micro-step both wastes bandwidth and gives DDP
-            # more backwards than it accounts for, which corrupted the buckets.
+            # find_unused_parameters=True cannot be paired with no_sync(): the
+            # unused-param bookkeeping breaks across micro-steps and triggers
+            # "Expected to have finished reduction in the prior iteration".
+            # Always sync under DDP; keep accum_steps for effective batch size.
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=args.amp and device.type == "cuda",
+            ):
+                loss_dict = model(images, targets)
+                loss = sum(loss_dict.values()) / args.accum_steps
+            scaler.scale(loss).backward()
             syncing = step % args.accum_steps == 0 or step == len(loader)
-            sync_context = (
-                model.no_sync() if distributed and not syncing else nullcontext()
-            )
-            with sync_context:
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=args.amp and device.type == "cuda",
-                ):
-                    loss_dict = model(images, targets)
-                    loss = sum(loss_dict.values()) / args.accum_steps
-                scaler.scale(loss).backward()
             if syncing:
                 global_step += 1
                 epoch_steps += 1

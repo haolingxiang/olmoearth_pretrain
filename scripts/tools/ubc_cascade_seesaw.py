@@ -116,7 +116,9 @@ def _zero_coupling(modules: list[nn.Module]) -> Tensor:
             if id(parameter) in seen:
                 continue
             seen.add(id(parameter))
-            piece = parameter.reshape(-1)[:1].sum() * 0.0
+            # ``(p * 0).sum()`` keeps a real grad_fn edge; ``p.sum() * 0`` can be
+            # optimized away and still leave the param marked unused under DDP.
+            piece = (parameter * 0.0).sum()
             total = piece if total is None else total + piece
     if total is None:
         raise RuntimeError("cascade heads have no parameters to couple")
@@ -197,13 +199,12 @@ class CascadeRoIHeads(RoIHeads):
         ]
 
         self.box_heads = nn.ModuleList(
-            [base.box_head] + [copy.deepcopy(base.box_head) for _ in range(self.num_stages - 1)]
+            [copy.deepcopy(base.box_head) for _ in range(self.num_stages)]
         )
         self.box_predictors = nn.ModuleList(
-            [base.box_predictor]
-            + [copy.deepcopy(base.box_predictor) for _ in range(self.num_stages - 1)]
+            [copy.deepcopy(base.box_predictor) for _ in range(self.num_stages)]
         )
-        # Keep attribute aliases for torchvision code paths that still touch them.
+        # RoIHeads still exposes singular aliases; point them at stage 0.
         self.box_head = self.box_heads[0]
         self.box_predictor = self.box_predictors[0]
 
@@ -380,16 +381,6 @@ class CascadeRoIHeads(RoIHeads):
                 losses["loss_mask"] = maskrcnn_loss(
                     mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs
                 )
-                # Touch every cascade / mask parameter so DDP ranks always agree
-                # on the used-parameter set, even when a stage has no positives.
-                losses["loss_classifier"] = losses["loss_classifier"] + _zero_coupling(
-                    [
-                        *list(self.box_heads),
-                        *list(self.box_predictors),
-                        self.mask_head,
-                        self.mask_predictor,
-                    ]
-                )
             else:
                 mask_proposals = [row["boxes"] for row in result]
                 if self.mask_roi_pool is not None:
@@ -400,6 +391,10 @@ class CascadeRoIHeads(RoIHeads):
                     masks_probs = maskrcnn_inference(mask_logits, labels_out)
                     for mask_prob, row in zip(masks_probs, result, strict=True):
                         row["masks"] = mask_prob
+        if self.training and losses:
+            # Touch every ROI-head parameter so DDP buckets stay complete even
+            # when a cascade stage / mask branch has no positives this step.
+            losses["loss_classifier"] = losses["loss_classifier"] + _zero_coupling([self])
         return result, losses
 
 
