@@ -99,32 +99,6 @@ class SeesawLoss(nn.Module):
         return F.cross_entropy(adjusted, labels)
 
 
-def _zero_coupling(modules: list[nn.Module]) -> Tensor:
-    """Keep every listed module in the autograd graph.
-
-    Detection heads skip a branch when a rank has no positives. Under DDP with
-    ``find_unused_parameters=False`` that rank then never produces a grad for
-    those weights, the reducer waits forever, and the other rank looks frozen.
-    Adding a 0-valued view of each parameter makes the graph identical.
-    """
-    total: Tensor | None = None
-    seen: set[int] = set()
-    for module in modules:
-        if module is None:
-            continue
-        for parameter in module.parameters():
-            if id(parameter) in seen:
-                continue
-            seen.add(id(parameter))
-            # Touch one scalar per parameter so DDP marks it used without
-            # allocating a full-sized temporary.
-            piece = parameter.reshape(-1)[:1].float().sum() * 0.0
-            total = piece if total is None else total + piece
-    if total is None:
-        raise RuntimeError("cascade heads have no parameters to couple")
-    return total
-
-
 def cascade_fastrcnn_loss(
     class_logits: Tensor,
     box_regression: Tensor,
@@ -391,10 +365,6 @@ class CascadeRoIHeads(RoIHeads):
                     masks_probs = maskrcnn_inference(mask_logits, labels_out)
                     for mask_prob, row in zip(masks_probs, result, strict=True):
                         row["masks"] = mask_prob
-        if self.training and losses:
-            # Touch every ROI-head parameter so DDP buckets stay complete even
-            # when a cascade stage / mask branch has no positives this step.
-            losses["loss_classifier"] = losses["loss_classifier"] + _zero_coupling([self])
         return result, losses
 
 

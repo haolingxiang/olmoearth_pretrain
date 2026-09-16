@@ -1,12 +1,13 @@
-"""UBC roof instance segmentation v3: Cascade + Seesaw + multi-GPU.
+"""UBC roof instance segmentation v3: Cascade + Seesaw.
 
 Extends the v2 neck with competition-proven detection heads:
 
 * Cascade Mask R-CNN ROI heads (IoU 0.5 / 0.6 / 0.7)
 * Seesaw classification loss for long-tailed roof types
-* ``torchrun`` / DDP multi-GPU training
 * Copy-Paste for rare classes
 * Multi-scale sliding-window evaluation
+
+Single-GPU only.
 """
 
 from __future__ import annotations
@@ -15,10 +16,8 @@ import argparse
 from collections import Counter, OrderedDict, defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import timedelta
 import json
 import math
-import os
 from pathlib import Path
 import random
 import time
@@ -27,12 +26,9 @@ from typing import Any, Literal
 import numpy as np
 from PIL import Image
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.ops import MultiScaleRoIAlign, batched_nms
@@ -202,7 +198,6 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         augment: bool,
         max_images: int | None = None,
         copy_paste_probability: float = 0.0,
-        require_instances: bool = False,
     ) -> None:
         self.index = index
         self.images = (
@@ -218,12 +213,6 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         self.balanced_extra_samples = balanced_extra_samples
         self.augment = augment
         self.copy_paste_probability = copy_paste_probability
-        self.require_instances = require_instances
-        self.annotated_image_ids = [
-            int(row["id"])
-            for row in self.images
-            if index.annotations_by_image[int(row["id"])]
-        ]
         counts = Counter(
             int(ann["category_id"])
             for anns in index.annotations_by_image.values()
@@ -425,22 +414,6 @@ class UBCTileDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
     def __getitem__(self, item: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         row, target_annotation = self._pick_row_and_target(item)
         crop, masks, labels, original_areas = self._extract(row, target_annotation)
-        # An empty crop makes the mask branch parameter-free for this rank only,
-        # which deadlocks DDP's unused-parameter handshake. Force a target.
-        retries = 0
-        while self.require_instances and not masks:
-            if not self.annotated_image_ids:
-                raise RuntimeError("DDP training needs at least one annotated image")
-            retries += 1
-            if retries > 32:
-                raise RuntimeError(
-                    "failed to sample a crop with instances; DDP cannot train on empty targets"
-                )
-            row = self.index.image_by_id[random.choice(self.annotated_image_ids)]
-            target_annotation = random.choice(
-                self.index.annotations_by_image[int(row["id"])]
-            )
-            crop, masks, labels, original_areas = self._extract(row, target_annotation)
 
         if self.augment:
             crop, masks, labels, original_areas = self._copy_paste(
@@ -547,7 +520,6 @@ class OlmoEarthPyramid(nn.Module):
         s2_rgb_mode: S2RgbMode,
         unfreeze_backbone: bool = False,
         use_detail_skip: bool = True,
-        encoder_fp32: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = olmo.encoder
@@ -556,9 +528,6 @@ class OlmoEarthPyramid(nn.Module):
         self.s2_rgb_mode = s2_rgb_mode
         self.unfreeze_backbone = unfreeze_backbone
         self.use_detail_skip = use_detail_skip
-        # Under DDP, bf16 attention backward on long token sequences has produced
-        # non-finite encoder grads while the same setup is fine on one GPU.
-        self.encoder_fp32 = encoder_fp32
         for parameter in self.encoder.parameters():
             parameter.requires_grad = unfreeze_backbone
         if not unfreeze_backbone:
@@ -666,14 +635,7 @@ class OlmoEarthPyramid(nn.Module):
         if images.shape[-1] % self.patch_size or images.shape[-2] % self.patch_size:
             raise ValueError("tile dimensions must be divisible by --patch-size")
         context = nullcontext() if self.unfreeze_backbone else torch.no_grad()
-        # Only disable autocast here. Re-enabling without a dtype would silently
-        # cast the encoder to float16.
-        precision: Any = (
-            torch.autocast(device_type=images.device.type, enabled=False)
-            if self.encoder_fp32
-            else nullcontext()
-        )
-        with context, precision:
+        with context:
             encoded = self.encoder(
                 self._sample(images), fast_pass=True, patch_size=self.patch_size
             )["tokens_and_masks"]
@@ -721,13 +683,11 @@ def build_model(
     use_cascade: bool = True,
     use_seesaw: bool = True,
     class_counts: list[int] | None = None,
-    encoder_fp32: bool = False,
 ) -> MaskRCNN:
     state = "fine-tunable" if unfreeze_backbone else "frozen"
     print(
         f"loading {state} OlmoEarth backbone from {weights} "
-        f"(v3 neck; cascade={use_cascade}, seesaw={use_seesaw}, "
-        f"encoder_fp32={encoder_fp32})"
+        f"(v3 neck; cascade={use_cascade}, seesaw={use_seesaw})"
     )
     olmo = load_model_from_path(weights)
     config = json.loads((weights / "config.json").read_text(encoding="utf-8"))
@@ -740,7 +700,6 @@ def build_model(
         s2_rgb_mode,
         unfreeze_backbone,
         use_detail_skip=use_detail_skip,
-        encoder_fp32=encoder_fp32,
     )
     feature_names = ["0", "1", "2", "3", "4"]
     anchors = AnchorGenerator(
@@ -1316,66 +1275,6 @@ def _checkpoint_args(checkpoint: dict[str, Any], args: argparse.Namespace) -> No
             )
 
 
-def setup_distributed() -> tuple[bool, int, int, int]:
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size <= 1:
-        return False, 0, 0, 1
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = int(os.environ["RANK"])
-    torch.cuda.set_device(local_rank)
-    # Fail fast on NCCL desync instead of hanging until the cluster kills the job.
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    dist.init_process_group(
-        backend="nccl",
-        device_id=torch.device("cuda", local_rank),
-        timeout=timedelta(minutes=60),
-    )
-    return True, local_rank, rank, world_size
-
-
-def cleanup_distributed(enabled: bool) -> None:
-    if enabled and dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def unwrap_model(model: nn.Module) -> nn.Module:
-    return model.module if isinstance(model, DDP) else model
-
-
-def broadcast_module(module: nn.Module, src: int = 0) -> None:
-    """Broadcast parameters and buffers from ``src`` so every rank starts aligned."""
-    for tensor in list(module.parameters()) + list(module.buffers()):
-        dist.broadcast(tensor.data, src=src)
-
-
-def allreduce_gradients(parameters: list[nn.Parameter], world_size: int) -> None:
-    """Average gradients across ranks.
-
-    Unlike DDP, unused Cascade / mask parameters (grad is None) are filled with
-    zeros before the collective, so every rank always participates in the same
-    allreduce set. That removes the NCCL deadlocks DDP hits on this model.
-    """
-    grads: list[torch.Tensor] = []
-    for parameter in parameters:
-        if not parameter.requires_grad:
-            continue
-        if parameter.grad is None:
-            parameter.grad = torch.zeros_like(parameter.data)
-        grads.append(parameter.grad)
-    if not grads:
-        return
-    flat = torch._utils._flatten_dense_tensors(grads)
-    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-    flat.div_(world_size)
-    for grad, synced in zip(
-        grads, torch._utils._unflatten_dense_tensors(flat, grads), strict=True
-    ):
-        grad.copy_(synced)
-
-
-def is_main_process(rank: int) -> bool:
-    return rank == 0
-
 
 def parse_eval_scales(raw: str) -> list[float]:
     scales = [float(part.strip()) for part in raw.split(",") if part.strip()]
@@ -1385,36 +1284,15 @@ def parse_eval_scales(raw: str) -> list[float]:
 
 
 def train(args: argparse.Namespace) -> None:
-    distributed, local_rank, rank, world_size = setup_distributed()
-    try:
-        _train_impl(args, distributed, local_rank, rank, world_size)
-    finally:
-        cleanup_distributed(distributed)
-
-
-def _train_impl(
-    args: argparse.Namespace,
-    distributed: bool,
-    local_rank: int,
-    rank: int,
-    world_size: int,
-) -> None:
-    seed = args.seed + rank
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if distributed:
-        device = torch.device("cuda", local_rank)
-    else:
-        default_device = "cuda" if torch.cuda.is_available() else "cpu"
-        device = torch.device(args.device or default_device)
+        torch.cuda.manual_seed_all(args.seed)
+    default_device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(args.device or default_device)
     out_dir = Path(args.out_dir)
-    if is_main_process(rank):
-        out_dir.mkdir(parents=True, exist_ok=True)
-    if distributed:
-        dist.barrier()
+    out_dir.mkdir(parents=True, exist_ok=True)
     train_paths = resolve_split_paths(Path(args.data_root), args.task, "train")
     val_paths = resolve_split_paths(Path(args.data_root), args.task, "val")
     train_index, val_index = CocoIndex(train_paths), CocoIndex(val_paths)
@@ -1429,34 +1307,18 @@ def _train_impl(
         augment=True,
         max_images=args.max_train_images,
         copy_paste_probability=args.copy_paste_probability,
-        require_instances=distributed,
     )
-    sampler: DistributedSampler | None = None
-    if distributed:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            seed=args.seed,
-            drop_last=True,
-        )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=sampler is None,
-        sampler=sampler,
+        shuffle=True,
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.workers > 0,
-        drop_last=distributed,
         collate_fn=collate_detection,
     )
     class_counts = collect_class_counts(train_index, NUM_CLASSES)
     args._class_counts = class_counts
-    # Keep encoder in bf16 under autocast so FlashAttention stays available.
-    # Forcing math SDPA on 512/patch-4 (~16k tokens) materializes QK^T and OOMs
-    # even on 48GB cards (~24GB just for one attention map).
     model = build_model(
         Path(args.weights),
         args.task,
@@ -1469,29 +1331,19 @@ def _train_impl(
         use_cascade=args.cascade,
         use_seesaw=args.seesaw,
         class_counts=class_counts,
-        encoder_fp32=False,
     )
     if args.init_ckpt:
         checkpoint = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
         load_trainable_state(model, checkpoint)
-    if distributed:
-        for parameter in model.parameters():
-            parameter.data = parameter.data.contiguous()
-        # Do not wrap with DDP. Cascade Mask R-CNN leaves different unused-param
-        # sets across ranks; DDP's reducer then deadlocks on the first step.
-        # Manual allreduce after backward is deadlock-free for this graph.
-        broadcast_module(model, src=0)
-        dist.barrier()
-    raw_model = model
     encoder_parameters = [
         parameter
-        for parameter in raw_model.backbone.encoder.parameters()
+        for parameter in model.backbone.encoder.parameters()
         if parameter.requires_grad
     ]
     encoder_ids = {id(parameter) for parameter in encoder_parameters}
     head_parameters = [
         parameter
-        for parameter in raw_model.parameters()
+        for parameter in model.parameters()
         if parameter.requires_grad and id(parameter) not in encoder_ids
     ]
     parameters = head_parameters + encoder_parameters
@@ -1505,7 +1357,7 @@ def _train_impl(
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         _checkpoint_args(checkpoint, args)
-        load_trainable_state(raw_model, checkpoint)
+        load_trainable_state(model, checkpoint)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = int(checkpoint["epoch"]) + 1
@@ -1513,35 +1365,25 @@ def _train_impl(
             best_ap50 = float(checkpoint["best_ap50"])
         elif checkpoint.get("metrics"):
             best_ap50 = float(checkpoint["metrics"].get("AP50", -1.0))
-        if distributed:
-            broadcast_module(raw_model, src=0)
     trainable = sum(parameter.numel() for parameter in parameters)
     frozen = sum(
-        parameter.numel()
-        for parameter in raw_model.parameters()
-        if not parameter.requires_grad
+        parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
     )
-    if is_main_process(rank):
-        print(
-            f"task={args.task} device={device} world_size={world_size} "
-            f"train_images={len(dataset.images)} val_images={len(val_index.images)} "
-            f"tiles/epoch={len(dataset)}"
-        )
-        print(
-            f"crop sampling: per-image slots={args.samples_per_image}, "
-            f"additional global class-balanced slots={dataset.balanced_extra_samples}, "
-            f"copy_paste_p={args.copy_paste_probability}, "
-            f"cascade={args.cascade}, seesaw={args.seesaw}"
-        )
-        print(f"parameters: trainable={trainable:,}, frozen={frozen:,}")
-        if distributed:
-            print(
-                "distributed: manual grad allreduce (no DDP wrapper)",
-                flush=True,
-            )
+    print(
+        f"task={args.task} device={device} "
+        f"train_images={len(dataset.images)} val_images={len(val_index.images)} "
+        f"tiles/epoch={len(dataset)}"
+    )
+    print(
+        f"crop sampling: per-image slots={args.samples_per_image}, "
+        f"additional global class-balanced slots={dataset.balanced_extra_samples}, "
+        f"copy_paste_p={args.copy_paste_probability}, "
+        f"cascade={args.cascade}, seesaw={args.seesaw}"
+    )
+    print(f"parameters: trainable={trainable:,}, frozen={frozen:,}")
     history_path = out_dir / "history.json"
     history: list[dict[str, Any]] = []
-    if args.resume and history_path.exists() and is_main_process(rank):
+    if args.resume and history_path.exists():
         loaded_history = json.loads(history_path.read_text(encoding="utf-8"))
         if isinstance(loaded_history, list):
             history = [
@@ -1552,8 +1394,6 @@ def _train_impl(
 
     global_step = 0
     for epoch in range(start_epoch, args.epochs + 1):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         epoch_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -1562,11 +1402,7 @@ def _train_impl(
         epoch_steps = 0
         skipped_steps = 0
         started = time.time()
-        progress = tqdm(
-            loader,
-            desc=f"epoch {epoch}/{args.epochs}",
-            disable=not is_main_process(rank),
-        )
+        progress = tqdm(loader, desc=f"epoch {epoch}/{args.epochs}")
         for step, (images, targets) in enumerate(progress, start=1):
             images = [image.to(device, non_blocking=True) for image in images]
             targets = [
@@ -1590,30 +1426,17 @@ def _train_impl(
                 global_step += 1
                 epoch_steps += 1
                 warmup = min(1.0, global_step / max(args.warmup_iters, 1))
-                for group, epoch_lr in zip(
-                    optimizer.param_groups, epoch_lrs, strict=True
-                ):
+                for group, epoch_lr in zip(optimizer.param_groups, epoch_lrs, strict=True):
                     group["lr"] = epoch_lr * warmup
-                if distributed:
-                    allreduce_gradients(parameters, world_size)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters, args.clip_grad_norm
-                )
-                finite = torch.tensor(
-                    1 if torch.isfinite(grad_norm) else 0,
-                    device=device,
-                    dtype=torch.int32,
-                )
-                if distributed:
-                    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-                if int(finite.item()) == 1:
+                grad_norm = torch.nn.utils.clip_grad_norm_(parameters, args.clip_grad_norm)
+                if torch.isfinite(grad_norm):
                     optimizer.step()
                 else:
                     skipped_steps += 1
-                    if is_main_process(rank) and skipped_steps <= 3:
+                    if skipped_steps <= 3:
                         bad = [
                             name
-                            for name, parameter in raw_model.named_parameters()
+                            for name, parameter in model.named_parameters()
                             if parameter.grad is not None
                             and not torch.isfinite(parameter.grad).all()
                         ]
@@ -1625,7 +1448,7 @@ def _train_impl(
                     if epoch_steps >= 20 and skipped_steps * 2 >= epoch_steps:
                         raise RuntimeError(
                             f"non-finite gradients on {skipped_steps}/{epoch_steps} "
-                            "optimizer steps under distributed training"
+                            "optimizer steps"
                         )
                 optimizer.zero_grad(set_to_none=True)
             if torch.isfinite(loss.detach()):
@@ -1633,9 +1456,7 @@ def _train_impl(
                     totals[name] += float(value.detach())
                 totals["loss"] += float(sum(loss_dict.values()).detach())
                 batches += 1
-            if is_main_process(rank) and (
-                step % args.log_every == 0 or step == len(loader)
-            ):
+            if step % args.log_every == 0 or step == len(loader):
                 denominator = max(batches, 1)
                 postfix = {
                     "loss": f"{totals['loss'] / denominator:.4f}",
@@ -1647,8 +1468,6 @@ def _train_impl(
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
                 progress.set_postfix(postfix, refresh=True)
-                # Newline so ``tail -f`` on a redirected log shows progress (tqdm
-                # normally rewrites the same line with ``\\r`` and looks frozen).
                 print(
                     f"epoch={epoch} step={step}/{len(loader)} "
                     f"loss={postfix['loss']} cls={postfix['cls']} "
@@ -1657,7 +1476,6 @@ def _train_impl(
                     f"lr={postfix['lr']} skipped={skipped_steps}",
                     flush=True,
                 )
-        # Undo the warmup scaling so the cosine schedule sees its own lrs.
         for group, epoch_lr in zip(optimizer.param_groups, epoch_lrs, strict=True):
             group["lr"] = epoch_lr
         scheduler.step()
@@ -1670,10 +1488,10 @@ def _train_impl(
         }
         metrics: dict[str, float] | None = None
         should_eval = epoch % args.eval_every == 0 or epoch == args.epochs
-        if should_eval and is_main_process(rank):
+        if should_eval:
             save_checkpoint(
                 out_dir / "last.pt",
-                raw_model,
+                model,
                 optimizer,
                 scheduler,
                 epoch,
@@ -1682,7 +1500,7 @@ def _train_impl(
                 best_ap50=best_ap50,
             )
             predictions, image_ids = predict_split(
-                raw_model, val_index, args, device, max_images=args.val_max_images
+                model, val_index, args, device, max_images=args.val_max_images
             )
             prediction_path = out_dir / f"val_epoch_{epoch:03d}.json"
             prediction_path.write_text(json.dumps(predictions), encoding="utf-8")
@@ -1697,7 +1515,7 @@ def _train_impl(
                 f"rpn_box={row['loss_rpn_box_reg']:.4f} "
                 f"val_AP={metrics['AP']:.4f} val_AP50={metrics['AP50']:.4f}"
             )
-        elif is_main_process(rank):
+        else:
             print(
                 f"epoch={epoch} loss={row['loss']:.4f} "
                 f"cls={row['loss_classifier']:.4f} "
@@ -1706,24 +1524,12 @@ def _train_impl(
                 f"obj={row['loss_objectness']:.4f} "
                 f"rpn_box={row['loss_rpn_box_reg']:.4f}"
             )
-        if is_main_process(rank):
-            history.append(row)
-            if metrics is not None and metrics["AP50"] > best_ap50:
-                best_ap50 = metrics["AP50"]
-                save_checkpoint(
-                    out_dir / "best.pt",
-                    raw_model,
-                    optimizer,
-                    scheduler,
-                    epoch,
-                    args,
-                    metrics,
-                    best_ap50,
-                )
-                print(f"saved best.pt (AP50={best_ap50:.4f})")
+        history.append(row)
+        if metrics is not None and metrics["AP50"] > best_ap50:
+            best_ap50 = metrics["AP50"]
             save_checkpoint(
-                out_dir / "last.pt",
-                raw_model,
+                out_dir / "best.pt",
+                model,
                 optimizer,
                 scheduler,
                 epoch,
@@ -1731,13 +1537,22 @@ def _train_impl(
                 metrics,
                 best_ap50,
             )
-            history_path.write_text(
-                json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        if distributed:
-            dist.barrier()
-    if is_main_process(rank):
-        print(f"training complete: {out_dir}")
+            print(f"saved best.pt (AP50={best_ap50:.4f})")
+        save_checkpoint(
+            out_dir / "last.pt",
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            args,
+            metrics,
+            best_ap50,
+        )
+        history_path.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    print(f"training complete: {out_dir}")
+
 
 
 def load_for_inference(
@@ -1907,12 +1722,10 @@ def add_inference(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    # torchrun may inject this; we read rank from the environment instead.
-    parser.add_argument("--local-rank", "--local_rank", type=int, default=-1)
     commands = parser.add_subparsers(dest="command", required=True)
 
     train_parser = commands.add_parser(
-        "train", help="train v3 Cascade+Seesaw Mask R-CNN (DDP)"
+        "train", help="train v3 Cascade+Seesaw Mask R-CNN (single GPU)"
     )
     add_common(train_parser)
     add_inference(train_parser)
@@ -1988,17 +1801,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="warm-start compatible heads (e.g. multimodal from a single checkpoint)",
     )
-    train_parser.add_argument("--local-rank", "--local_rank", type=int, default=-1)
-    train_parser.add_argument(
-        "--ddp-find-unused",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    train_parser.add_argument(
-        "--ddp-static-graph",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
 
     for name in ("eval", "predict"):
         sub = commands.add_parser(name)
@@ -2060,18 +1862,6 @@ def validate_args(args: argparse.Namespace) -> None:
         parse_eval_scales(args.eval_scales)
         if args.log_every < 1:
             raise ValueError("--log-every must be positive")
-        if getattr(args, "ddp_static_graph", False):
-            print(
-                "warning: --ddp-static-graph is ignored; it is incompatible with "
-                "gradient accumulation and previously produced NaN grads",
-                flush=True,
-            )
-        if getattr(args, "ddp_find_unused", False):
-            print(
-                "warning: --ddp-find-unused is ignored; mismatched unused-parameter "
-                "sets deadlock DDP on this model",
-                flush=True,
-            )
     if hasattr(args, "pre_mask_nms_topk") and args.pre_mask_nms_topk < 1:
         raise ValueError("--pre-mask-nms-topk must be positive")
     if hasattr(args, "tile_border_margin") and args.tile_border_margin < 1:
@@ -2083,15 +1873,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = build_parser()
-    args, unknown = parser.parse_known_args()
-    leftover = [
-        token
-        for token in unknown
-        if not token.startswith("--local-rank") and not token.startswith("--local_rank")
-    ]
-    if leftover:
-        parser.error(f"unrecognized arguments: {' '.join(leftover)}")
+    args = build_parser().parse_args()
     validate_args(args)
     if args.command == "train":
         train(args)
