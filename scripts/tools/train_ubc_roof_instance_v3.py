@@ -1508,15 +1508,23 @@ def _train_impl(
                 {key: value.to(device, non_blocking=True) for key, value in target.items()}
                 for target in targets
             ]
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=args.amp and device.type == "cuda",
-            ):
-                loss_dict = model(images, targets)
-                loss = sum(loss_dict.values()) / args.accum_steps
-            scaler.scale(loss).backward()
-            if step % args.accum_steps == 0 or step == len(loader):
+            # Only all-reduce on the step that actually updates the weights.
+            # Reducing on every micro-step is both wasteful and, under
+            # static_graph, feeds DDP more backwards than it expects.
+            syncing = step % args.accum_steps == 0 or step == len(loader)
+            sync_context = (
+                model.no_sync() if distributed and not syncing else nullcontext()
+            )
+            with sync_context:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=args.amp and device.type == "cuda",
+                ):
+                    loss_dict = model(images, targets)
+                    loss = sum(loss_dict.values()) / args.accum_steps
+                scaler.scale(loss).backward()
+            if syncing:
                 global_step += 1
                 # Linear warmup: the freshly initialised cascade heads produce
                 # huge early gradients on top of an unfrozen encoder.
@@ -1536,18 +1544,6 @@ def _train_impl(
                     scaler.step(optimizer)
                 else:
                     skipped_steps += 1
-                    if is_main_process(rank) and skipped_steps <= 3:
-                        bad = [
-                            name
-                            for name, parameter in raw_model.named_parameters()
-                            if parameter.grad is not None
-                            and not torch.isfinite(parameter.grad).all()
-                        ]
-                        print(
-                            f"non-finite grads at step {step}: "
-                            f"{len(bad)} params, first={bad[:8]}",
-                            flush=True,
-                        )
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
             if torch.isfinite(loss.detach()):
@@ -1974,6 +1970,11 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--eval-every must be positive")
         if args.backbone_lr <= 0:
             raise ValueError("--backbone-lr must be positive")
+        if args.ddp_static_graph and args.accum_steps > 1:
+            raise ValueError(
+                "--ddp-static-graph is incompatible with gradient accumulation, "
+                "which needs DDP no_sync(); drop one of them"
+            )
         if not 0 <= args.copy_paste_probability <= 1:
             raise ValueError("--copy-paste-probability must be in [0, 1]")
         parse_eval_scales(args.eval_scales)
