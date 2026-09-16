@@ -1423,9 +1423,9 @@ def _train_impl(
     )
     class_counts = collect_class_counts(train_index, NUM_CLASSES)
     args._class_counts = class_counts
-    # DDP + bf16 attention backward on 512/patch-4 tokens has been producing
-    # non-finite encoder grads; keep the encoder in fp32 when both are on.
-    encoder_fp32 = bool(distributed and args.unfreeze_backbone)
+    # Keep encoder in bf16 under autocast so FlashAttention stays available.
+    # Forcing math SDPA on 512/patch-4 (~16k tokens) materializes QK^T and OOMs
+    # even on 48GB cards (~24GB just for one attention map).
     model = build_model(
         Path(args.weights),
         args.task,
@@ -1438,32 +1438,22 @@ def _train_impl(
         use_cascade=args.cascade,
         use_seesaw=args.seesaw,
         class_counts=class_counts,
-        encoder_fp32=encoder_fp32,
+        encoder_fp32=False,
     )
     if args.init_ckpt:
         checkpoint = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
         load_trainable_state(model, checkpoint)
     if distributed:
-        # Flash / mem-efficient SDPA backward has been flaky under DDP for this
-        # encoder; force the math kernel so grads stay finite.
-        if device.type == "cuda":
-            torch.backends.cuda.enable_flash_sdp(False)
-            torch.backends.cuda.enable_mem_efficient_sdp(False)
-            torch.backends.cuda.enable_math_sdp(True)
         for parameter in model.parameters():
             parameter.data = parameter.data.contiguous()
-            if parameter.requires_grad:
-                parameter.register_hook(
-                    lambda grad: grad.contiguous() if grad is not None else grad
-                )
-        # Cascade / mask branches can leave a fixed set of params without grads.
-        # find_unused_parameters=True is OK because empty crops are rejected so
-        # both ranks agree. Never combine with no_sync().
+        # Bridge every trainable param into the loss each step so the used-param
+        # set is identical across ranks. That lets us keep find_unused=False and
+        # use no_sync() for accumulation (required for correct/fast DDP).
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             broadcast_buffers=False,
             static_graph=False,
         )
@@ -1518,9 +1508,10 @@ def _train_impl(
             f"cascade={args.cascade}, seesaw={args.seesaw}"
         )
         print(f"parameters: trainable={trainable:,}, frozen={frozen:,}")
-        if encoder_fp32:
+        if distributed:
             print(
-                "ddp: encoder_fp32=True, flash/mem-efficient SDPA disabled",
+                "ddp: find_unused_parameters=False, flash SDPA enabled, "
+                "param-bridge + no_sync accumulation",
                 flush=True,
             )
     history_path = out_dir / "history.json"
@@ -1557,21 +1548,36 @@ def _train_impl(
                 {key: value.to(device, non_blocking=True) for key, value in target.items()}
                 for target in targets
             ]
-            # find_unused_parameters=True cannot be paired with no_sync().
-            # Always sync under DDP; keep accum_steps for effective batch size.
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=args.amp and device.type == "cuda",
-            ):
-                loss_dict = model(images, targets)
-                loss = sum(loss_dict.values()) / args.accum_steps
-            if not torch.isfinite(loss.detach()):
-                raise RuntimeError(
-                    f"non-finite loss at epoch={epoch} step={step}: {loss_dict}"
-                )
-            loss.backward()
             syncing = step % args.accum_steps == 0 or step == len(loader)
+            # find_unused=False + param bridge allows no_sync on micro-steps.
+            sync_context = (
+                model.no_sync() if distributed and not syncing else nullcontext()
+            )
+            with sync_context:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=args.amp and device.type == "cuda",
+                ):
+                    loss_dict = model(images, targets)
+                    loss = sum(loss_dict.values()) / args.accum_steps
+                    if distributed:
+                        # Cheap scalar touch so every trainable weight is marked
+                        # used. Never do ``(p * 0).sum()`` over full tensors —
+                        # that would allocate another ~backbone-sized buffer.
+                        bridge = None
+                        for parameter in raw_model.parameters():
+                            if not parameter.requires_grad:
+                                continue
+                            piece = parameter.reshape(-1)[:1].float().sum() * 0.0
+                            bridge = piece if bridge is None else bridge + piece
+                        if bridge is not None:
+                            loss = loss + bridge
+                if not torch.isfinite(loss.detach()):
+                    raise RuntimeError(
+                        f"non-finite loss at epoch={epoch} step={step}: {loss_dict}"
+                    )
+                loss.backward()
             if syncing:
                 global_step += 1
                 epoch_steps += 1
@@ -1580,11 +1586,6 @@ def _train_impl(
                     optimizer.param_groups, epoch_lrs, strict=True
                 ):
                     group["lr"] = epoch_lr * warmup
-                # Contiguous grads satisfy the DDP bucket layout contract and
-                # avoid the "grad strides do not match bucket view" corruption.
-                for parameter in parameters:
-                    if parameter.grad is not None and not parameter.grad.is_contiguous():
-                        parameter.grad = parameter.grad.contiguous()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     parameters, args.clip_grad_norm
                 )

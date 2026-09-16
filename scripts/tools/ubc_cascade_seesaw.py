@@ -116,9 +116,9 @@ def _zero_coupling(modules: list[nn.Module]) -> Tensor:
             if id(parameter) in seen:
                 continue
             seen.add(id(parameter))
-            # ``(p * 0).sum()`` keeps a real grad_fn edge; ``p.sum() * 0`` can be
-            # optimized away and still leave the param marked unused under DDP.
-            piece = (parameter * 0.0).sum()
+            # Touch one scalar per parameter so DDP marks it used without
+            # allocating a full-sized temporary.
+            piece = parameter.reshape(-1)[:1].float().sum() * 0.0
             total = piece if total is None else total + piece
     if total is None:
         raise RuntimeError("cascade heads have no parameters to couple")
