@@ -1342,6 +1342,37 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def broadcast_module(module: nn.Module, src: int = 0) -> None:
+    """Broadcast parameters and buffers from ``src`` so every rank starts aligned."""
+    for tensor in list(module.parameters()) + list(module.buffers()):
+        dist.broadcast(tensor.data, src=src)
+
+
+def allreduce_gradients(parameters: list[nn.Parameter], world_size: int) -> None:
+    """Average gradients across ranks.
+
+    Unlike DDP, unused Cascade / mask parameters (grad is None) are filled with
+    zeros before the collective, so every rank always participates in the same
+    allreduce set. That removes the NCCL deadlocks DDP hits on this model.
+    """
+    grads: list[torch.Tensor] = []
+    for parameter in parameters:
+        if not parameter.requires_grad:
+            continue
+        if parameter.grad is None:
+            parameter.grad = torch.zeros_like(parameter.data)
+        grads.append(parameter.grad)
+    if not grads:
+        return
+    flat = torch._utils._flatten_dense_tensors(grads)
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat.div_(world_size)
+    for grad, synced in zip(
+        grads, torch._utils._unflatten_dense_tensors(flat, grads), strict=True
+    ):
+        grad.copy_(synced)
+
+
 def is_main_process(rank: int) -> bool:
     return rank == 0
 
@@ -1446,20 +1477,12 @@ def _train_impl(
     if distributed:
         for parameter in model.parameters():
             parameter.data = parameter.data.contiguous()
-        # Cascade leaves a stable set of unused params every step. Use
-        # find_unused_parameters=True so the reducer does not wait forever.
-        # Do NOT use no_sync() with this setting — micro-step bookkeeping and
-        # unused-param detection deadlock on the first synchronizing backward.
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True,
-            broadcast_buffers=False,
-            static_graph=False,
-        )
+        # Do not wrap with DDP. Cascade Mask R-CNN leaves different unused-param
+        # sets across ranks; DDP's reducer then deadlocks on the first step.
+        # Manual allreduce after backward is deadlock-free for this graph.
+        broadcast_module(model, src=0)
         dist.barrier()
-    raw_model = unwrap_model(model)
+    raw_model = model
     encoder_parameters = [
         parameter
         for parameter in raw_model.backbone.encoder.parameters()
@@ -1490,6 +1513,8 @@ def _train_impl(
             best_ap50 = float(checkpoint["best_ap50"])
         elif checkpoint.get("metrics"):
             best_ap50 = float(checkpoint["metrics"].get("AP50", -1.0))
+        if distributed:
+            broadcast_module(raw_model, src=0)
     trainable = sum(parameter.numel() for parameter in parameters)
     frozen = sum(
         parameter.numel()
@@ -1511,7 +1536,7 @@ def _train_impl(
         print(f"parameters: trainable={trainable:,}, frozen={frozen:,}")
         if distributed:
             print(
-                "ddp: find_unused_parameters=True, flash SDPA, sync every micro-step",
+                "distributed: manual grad allreduce (no DDP wrapper)",
                 flush=True,
             )
     history_path = out_dir / "history.json"
@@ -1548,8 +1573,6 @@ def _train_impl(
                 {key: value.to(device, non_blocking=True) for key, value in target.items()}
                 for target in targets
             ]
-            # Always synchronize under DDP. no_sync + find_unused_parameters is
-            # what made step 1 look fine and step 2 hang on NCCL forever.
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -1571,6 +1594,8 @@ def _train_impl(
                     optimizer.param_groups, epoch_lrs, strict=True
                 ):
                     group["lr"] = epoch_lr * warmup
+                if distributed:
+                    allreduce_gradients(parameters, world_size)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     parameters, args.clip_grad_norm
                 )
@@ -1600,7 +1625,7 @@ def _train_impl(
                     if epoch_steps >= 20 and skipped_steps * 2 >= epoch_steps:
                         raise RuntimeError(
                             f"non-finite gradients on {skipped_steps}/{epoch_steps} "
-                            "optimizer steps under DDP"
+                            "optimizer steps under distributed training"
                         )
                 optimizer.zero_grad(set_to_none=True)
             if torch.isfinite(loss.detach()):
