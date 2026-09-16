@@ -1498,6 +1498,16 @@ def _train_impl(
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
                 progress.set_postfix(postfix, refresh=True)
+                # Newline so ``tail -f`` on a redirected log shows progress (tqdm
+                # normally rewrites the same line with ``\\r`` and looks frozen).
+                print(
+                    f"epoch={epoch} step={step}/{len(loader)} "
+                    f"loss={postfix['loss']} cls={postfix['cls']} "
+                    f"box={postfix['box']} mask={postfix['mask']} "
+                    f"obj={postfix['obj']} rpn_box={postfix['rpn_box']} "
+                    f"lr={postfix['lr']}",
+                    flush=True,
+                )
         scheduler.step()
         row: dict[str, Any] = {
             "epoch": epoch,
