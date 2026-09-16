@@ -547,6 +547,7 @@ class OlmoEarthPyramid(nn.Module):
         s2_rgb_mode: S2RgbMode,
         unfreeze_backbone: bool = False,
         use_detail_skip: bool = True,
+        encoder_fp32: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = olmo.encoder
@@ -555,6 +556,9 @@ class OlmoEarthPyramid(nn.Module):
         self.s2_rgb_mode = s2_rgb_mode
         self.unfreeze_backbone = unfreeze_backbone
         self.use_detail_skip = use_detail_skip
+        # Under DDP, bf16 attention backward on long token sequences has produced
+        # non-finite encoder grads while the same setup is fine on one GPU.
+        self.encoder_fp32 = encoder_fp32
         for parameter in self.encoder.parameters():
             parameter.requires_grad = unfreeze_backbone
         if not unfreeze_backbone:
@@ -662,7 +666,14 @@ class OlmoEarthPyramid(nn.Module):
         if images.shape[-1] % self.patch_size or images.shape[-2] % self.patch_size:
             raise ValueError("tile dimensions must be divisible by --patch-size")
         context = nullcontext() if self.unfreeze_backbone else torch.no_grad()
-        with context:
+        # Only disable autocast here. Re-enabling without a dtype would silently
+        # cast the encoder to float16.
+        precision: Any = (
+            torch.autocast(device_type=images.device.type, enabled=False)
+            if self.encoder_fp32
+            else nullcontext()
+        )
+        with context, precision:
             encoded = self.encoder(
                 self._sample(images), fast_pass=True, patch_size=self.patch_size
             )["tokens_and_masks"]
@@ -710,11 +721,13 @@ def build_model(
     use_cascade: bool = True,
     use_seesaw: bool = True,
     class_counts: list[int] | None = None,
+    encoder_fp32: bool = False,
 ) -> MaskRCNN:
     state = "fine-tunable" if unfreeze_backbone else "frozen"
     print(
         f"loading {state} OlmoEarth backbone from {weights} "
-        f"(v3 neck; cascade={use_cascade}, seesaw={use_seesaw})"
+        f"(v3 neck; cascade={use_cascade}, seesaw={use_seesaw}, "
+        f"encoder_fp32={encoder_fp32})"
     )
     olmo = load_model_from_path(weights)
     config = json.loads((weights / "config.json").read_text(encoding="utf-8"))
@@ -727,6 +740,7 @@ def build_model(
         s2_rgb_mode,
         unfreeze_backbone,
         use_detail_skip=use_detail_skip,
+        encoder_fp32=encoder_fp32,
     )
     feature_names = ["0", "1", "2", "3", "4"]
     anchors = AnchorGenerator(
@@ -1409,6 +1423,9 @@ def _train_impl(
     )
     class_counts = collect_class_counts(train_index, NUM_CLASSES)
     args._class_counts = class_counts
+    # DDP + bf16 attention backward on 512/patch-4 tokens has been producing
+    # non-finite encoder grads; keep the encoder in fp32 when both are on.
+    encoder_fp32 = bool(distributed and args.unfreeze_backbone)
     model = build_model(
         Path(args.weights),
         args.task,
@@ -1421,15 +1438,27 @@ def _train_impl(
         use_cascade=args.cascade,
         use_seesaw=args.seesaw,
         class_counts=class_counts,
+        encoder_fp32=encoder_fp32,
     )
     if args.init_ckpt:
         checkpoint = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
         load_trainable_state(model, checkpoint)
     if distributed:
-        # Cascade / mask branches can leave a fixed set of params without grads
-        # on a given step. find_unused_parameters=True is safe here because both
-        # ranks see the same unused set (empty crops are rejected). Do not pair
-        # this with no_sync(); see the training loop below.
+        # Flash / mem-efficient SDPA backward has been flaky under DDP for this
+        # encoder; force the math kernel so grads stay finite.
+        if device.type == "cuda":
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(True)
+        for parameter in model.parameters():
+            parameter.data = parameter.data.contiguous()
+            if parameter.requires_grad:
+                parameter.register_hook(
+                    lambda grad: grad.contiguous() if grad is not None else grad
+                )
+        # Cascade / mask branches can leave a fixed set of params without grads.
+        # find_unused_parameters=True is OK because empty crops are rejected so
+        # both ranks agree. Never combine with no_sync().
         model = DDP(
             model,
             device_ids=[local_rank],
@@ -1457,9 +1486,6 @@ def _train_impl(
         groups.append({"params": encoder_parameters, "lr": args.backbone_lr})
     optimizer = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    # Autocast runs in bfloat16, whose exponent range matches float32, so loss
-    # scaling buys nothing and only adds an in-place unscale of every gradient.
-    scaler = torch.amp.GradScaler("cuda", enabled=False)
     start_epoch = 1
     best_ap50 = -1.0
     if args.resume:
@@ -1492,6 +1518,11 @@ def _train_impl(
             f"cascade={args.cascade}, seesaw={args.seesaw}"
         )
         print(f"parameters: trainable={trainable:,}, frozen={frozen:,}")
+        if encoder_fp32:
+            print(
+                "ddp: encoder_fp32=True, flash/mem-efficient SDPA disabled",
+                flush=True,
+            )
     history_path = out_dir / "history.json"
     history: list[dict[str, Any]] = []
     if args.resume and history_path.exists() and is_main_process(rank):
@@ -1526,9 +1557,7 @@ def _train_impl(
                 {key: value.to(device, non_blocking=True) for key, value in target.items()}
                 for target in targets
             ]
-            # find_unused_parameters=True cannot be paired with no_sync(): the
-            # unused-param bookkeeping breaks across micro-steps and triggers
-            # "Expected to have finished reduction in the prior iteration".
+            # find_unused_parameters=True cannot be paired with no_sync().
             # Always sync under DDP; keep accum_steps for effective batch size.
             with torch.autocast(
                 device_type=device.type,
@@ -1537,19 +1566,25 @@ def _train_impl(
             ):
                 loss_dict = model(images, targets)
                 loss = sum(loss_dict.values()) / args.accum_steps
-            scaler.scale(loss).backward()
+            if not torch.isfinite(loss.detach()):
+                raise RuntimeError(
+                    f"non-finite loss at epoch={epoch} step={step}: {loss_dict}"
+                )
+            loss.backward()
             syncing = step % args.accum_steps == 0 or step == len(loader)
             if syncing:
                 global_step += 1
                 epoch_steps += 1
-                # Linear warmup: the freshly initialised cascade heads produce
-                # huge early gradients on top of an unfrozen encoder.
                 warmup = min(1.0, global_step / max(args.warmup_iters, 1))
                 for group, epoch_lr in zip(
                     optimizer.param_groups, epoch_lrs, strict=True
                 ):
                     group["lr"] = epoch_lr * warmup
-                scaler.unscale_(optimizer)
+                # Contiguous grads satisfy the DDP bucket layout contract and
+                # avoid the "grad strides do not match bucket view" corruption.
+                for parameter in parameters:
+                    if parameter.grad is not None and not parameter.grad.is_contiguous():
+                        parameter.grad = parameter.grad.contiguous()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     parameters, args.clip_grad_norm
                 )
@@ -1561,15 +1596,26 @@ def _train_impl(
                 if distributed:
                     dist.all_reduce(finite, op=dist.ReduceOp.MIN)
                 if int(finite.item()) == 1:
-                    scaler.step(optimizer)
+                    optimizer.step()
                 else:
                     skipped_steps += 1
-                    if skipped_steps >= 20 and skipped_steps == epoch_steps:
-                        raise RuntimeError(
-                            f"all {skipped_steps} optimizer steps had non-finite "
-                            "gradients; training cannot make progress"
+                    if is_main_process(rank) and skipped_steps <= 3:
+                        bad = [
+                            name
+                            for name, parameter in raw_model.named_parameters()
+                            if parameter.grad is not None
+                            and not torch.isfinite(parameter.grad).all()
+                        ]
+                        print(
+                            f"non-finite grads at step {step}: "
+                            f"count={len(bad)} first={bad[:6]}",
+                            flush=True,
                         )
-                scaler.update()
+                    if epoch_steps >= 20 and skipped_steps * 2 >= epoch_steps:
+                        raise RuntimeError(
+                            f"non-finite gradients on {skipped_steps}/{epoch_steps} "
+                            "optimizer steps under DDP"
+                        )
                 optimizer.zero_grad(set_to_none=True)
             if torch.isfinite(loss.detach()):
                 for name, value in loss_dict.items():
