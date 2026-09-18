@@ -1300,9 +1300,12 @@ def evaluate_coco(
         values = values[values > -1]
         name = coco_gt.cats[int(category_id)]["name"]
         metrics[f"AP50_{name}"] = float(values.mean()) if values.size else 0.0
-    metrics["AP50_building"] = _class_agnostic_ap50(
-        coco_gt, predictions, image_ids
-    )
+    try:
+        metrics["AP50_building"] = _class_agnostic_ap50(
+            coco_gt, predictions, image_ids
+        )
+    except Exception as exc:
+        print(f"AP50_building skipped: {exc}", flush=True)
     return metrics
 
 
@@ -1314,10 +1317,17 @@ def _class_agnostic_ap50(
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
 
-    dataset = json.loads(json.dumps(coco_gt.dataset))
-    dataset["categories"] = [{"id": 1, "name": "building", "supercategory": "building"}]
-    for annotation in dataset.get("annotations", []):
-        annotation["category_id"] = 1
+    # pycocotools keeps RLE counts as bytes; do not json-roundtrip the dataset.
+    dataset = {
+        "info": coco_gt.dataset.get("info", {}),
+        "licenses": coco_gt.dataset.get("licenses", []),
+        "images": coco_gt.dataset["images"],
+        "annotations": [
+            {**annotation, "category_id": 1}
+            for annotation in coco_gt.dataset.get("annotations", [])
+        ],
+        "categories": [{"id": 1, "name": "building", "supercategory": "building"}],
+    }
     agnostic_gt = COCO()
     agnostic_gt.dataset = dataset
     agnostic_gt.createIndex()
